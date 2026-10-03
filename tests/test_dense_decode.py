@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import torch
@@ -66,6 +67,7 @@ class DenseDecodeTests(unittest.TestCase):
                 "float32 has no available kernel"
             )
         self.model = self.model.to(device="cuda", dtype=torch.bfloat16)
+        self.model.config = replace(self.model.config, dtype=torch.bfloat16)
         self._compare_independent_dense(atol=2e-2, rtol=2e-2)
 
     def test_dense_storage_survives_decode_and_membership_changes(self):
