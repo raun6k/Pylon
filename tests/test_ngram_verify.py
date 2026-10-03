@@ -145,9 +145,9 @@ class PromptNgramTests(unittest.TestCase):
         eager = system_environ(base, "eager")
         pylon = system_environ(base, "pylon")
         self.assertEqual(eager["PYLON_SPECULATE_K"], "1")
-        self.assertEqual(pylon["PYLON_SPECULATE_K"], "4")
+        self.assertEqual(pylon["PYLON_SPECULATE_K"], "1")
         self.assertFalse(result_flags("eager", eager)["speculation"])
-        self.assertTrue(result_flags("pylon", pylon)["speculation"])
+        self.assertFalse(result_flags("pylon", pylon)["speculation"])
         self.assertFalse(result_flags("pylon")["speculation"])
         self.assertFalse(result_flags("vllm", {})["speculation"])
 

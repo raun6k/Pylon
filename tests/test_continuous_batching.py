@@ -830,16 +830,16 @@ class AdmitSkipConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PylonConfig(admit_skip=True)
 
-    def test_eager_column_forces_skip_off_and_pylon_uses_four(self) -> None:
+    def test_eager_and_pylon_columns_force_skip_off(self) -> None:
         base = {"PYLON_ADMIT_SKIP": "9", "PYLON_PREFIX_CACHE": "true"}
         eager = system_environ(base, "eager")
         pylon = system_environ(base, "pylon")
         self.assertEqual(eager["PYLON_ADMIT_SKIP"], "0")
-        self.assertEqual(pylon["PYLON_ADMIT_SKIP"], "4")
+        self.assertEqual(pylon["PYLON_ADMIT_SKIP"], "0")
         self.assertEqual(result_flags("eager", eager)["admit_skip"], 0)
         self.assertEqual(result_flags("eager", {"PYLON_ADMIT_SKIP": "4"})["admit_skip"], 0)
-        self.assertEqual(result_flags("pylon")["admit_skip"], 4)
-        self.assertEqual(result_flags("pylon", pylon)["admit_skip"], 4)
+        self.assertEqual(result_flags("pylon")["admit_skip"], 0)
+        self.assertEqual(result_flags("pylon", pylon)["admit_skip"], 0)
         self.assertEqual(result_flags("vllm")["admit_skip"], 0)
 
 

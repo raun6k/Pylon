@@ -232,14 +232,15 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(reuse_running_server(["eager"], "eager"))
         self.assertFalse(reuse_running_server(["eager", "pylon"], "eager"))
 
-    def test_pylon_column_enables_graphs_speculation_and_skip(self) -> None:
+    def test_pylon_column_enables_graphs_and_leaves_eager_flags_off(self) -> None:
         env = system_environ({}, "pylon")
         self.assertEqual(env["PYLON_CUDA_GRAPHS"], "true")
         self.assertEqual(env["PYLON_PREFIX_CACHE"], "false")
-        self.assertEqual(env["PYLON_SPECULATE_K"], "4")
-        self.assertEqual(env["PYLON_ADMIT_SKIP"], "4")
+        self.assertEqual(env["PYLON_SPECULATE_K"], "1")
+        self.assertEqual(env["PYLON_ADMIT_SKIP"], "0")
         self.assertTrue(result_flags("pylon", env)["cuda_graphs"])
-        self.assertTrue(result_flags("pylon", env)["speculation"])
+        self.assertFalse(result_flags("pylon", env)["speculation"])
+        self.assertEqual(result_flags("pylon", env)["admit_skip"], 0)
         self.assertFalse(result_flags("pylon", env)["prefix_cache"])
         self.assertFalse(result_flags("vllm", None)["speculation"])
         self.assertTrue(result_flags("vllm", None)["prefix_cache"])
