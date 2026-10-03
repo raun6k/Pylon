@@ -5,8 +5,10 @@ import math
 import os
 import platform
 import re
+import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +22,32 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "benchmarks" / "results"
 WORKLOADS = ROOT / "benchmarks" / "workloads"
+PLOTS = ROOT / "benchmarks" / "plots"
+VLLM_VERSION = "0.30.0"
+VLLM_URL = "http://127.0.0.1:8001"
+# The last flag is required on vLLM 0.30.0. Without it the response omits
+# usage.prompt_tokens_details.cached_tokens, and that column cannot be scored.
+VLLM_ARGV = (
+    "vllm",
+    "serve",
+    "Qwen/Qwen3-4B-Instruct-2507",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8001",
+    "--dtype",
+    "bfloat16",
+    "--tensor-parallel-size",
+    "1",
+    "--max-model-len",
+    "4096",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--enable-prefix-caching",
+    "--enable-per-request-metrics",
+    "--enable-prompt-tokens-details",
+)
+LINE_ORDER = ("eager", "pylon", "vllm")
 
 WARMUP_MESSAGES = (
     {"role": "user", "content": "Reply with the single word pylon."},
@@ -102,6 +130,7 @@ def request_json(
     *,
     timeout: float,
     payload: dict[str, Any] | None = None,
+    system: str = "pylon",
 ) -> dict[str, Any]:
     data = None if payload is None else json.dumps(payload).encode()
     request = Request(
@@ -112,12 +141,27 @@ def request_json(
     )
     try:
         with urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read())
+            body = response.read()
+            return json.loads(body) if body else {}
     except HTTPError as error:
         detail = error.read().decode(errors="replace")
-        raise RuntimeError(f"pylon returned HTTP {error.code} for {path}: {detail}") from error
+        raise RuntimeError(f"{system} returned HTTP {error.code} for {path}: {detail}") from error
     except URLError as error:
-        raise RuntimeError(f"Cannot reach pylon at {base_url}.") from error
+        raise RuntimeError(f"Cannot reach {system} at {base_url}.") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{system} returned a non-JSON body for {path}.") from error
+
+
+def http_ok(url: str, timeout: float) -> bool:
+    request = Request(url, method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            response.read()
+            return response.status == 200
+    except HTTPError:
+        return False
+    except URLError:
+        return False
 
 
 def git_revision() -> str | None:
@@ -158,10 +202,79 @@ class GpuSampler:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            started = time.perf_counter()
             sample = _nvml_used_bytes(self.pid)
             if sample is not None:
-                self.peak_bytes = sample if self.peak_bytes is None else max(self.peak_bytes, sample)
-            self._stop.wait(1)
+                self.peak_bytes = (
+                    sample if self.peak_bytes is None else max(self.peak_bytes, sample)
+                )
+            remaining = 1.0 - (time.perf_counter() - started)
+            if self._stop.wait(max(0.0, remaining)):
+                return
+
+
+def parse_used_gpu_memory(text: str, pids: set[int] | None) -> int | None:
+    peak = None
+    for line in text.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            app_pid = int(parts[0])
+            used_mib = float(parts[1])
+        except ValueError:
+            continue
+        if pids is not None and app_pid not in pids:
+            continue
+        used = int(used_mib * 1024 * 1024)
+        peak = used if peak is None else max(peak, used)
+    return peak
+
+
+def descendant_pids(root: int, children: dict[int, list[int]]) -> set[int]:
+    found = {root}
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        for child in children.get(current, ()):
+            if child not in found:
+                found.add(child)
+                stack.append(child)
+    return found
+
+
+def _process_children() -> dict[int, list[int]]:
+    result = subprocess.run(
+        ["ps", "-ax", "-o", "pid=", "-o", "ppid="],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise OSError(result.stderr.strip() or "ps failed")
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+            parent = int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(parent, []).append(pid)
+    return children
+
+
+def server_pids(root: int | None) -> set[int] | None:
+    if root is None:
+        return None
+    try:
+        children = _process_children()
+    except (OSError, subprocess.SubprocessError):
+        return {root}
+    return descendant_pids(root, children)
 
 
 def _nvml_used_bytes(pid: int | None) -> int | None:
@@ -181,21 +294,57 @@ def _nvml_used_bytes(pid: int | None) -> int | None:
         return None
     if result.returncode != 0:
         return None
-    peak = None
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 2:
-            continue
-        try:
-            app_pid = int(parts[0])
-            used_mib = float(parts[1])
-        except ValueError:
-            continue
-        if pid is not None and app_pid != pid:
-            continue
-        used = int(used_mib * 1024 * 1024)
-        peak = used if peak is None else max(peak, used)
-    return peak
+    return parse_used_gpu_memory(result.stdout, server_pids(pid))
+
+
+def query_gpu_identity() -> dict[str, str | None]:
+    empty = {"gpu_name": None, "driver_version": None}
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return empty
+    if result.returncode != 0:
+        return empty
+    line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
+    if not line or "," not in line:
+        return empty
+    name, driver = line.rsplit(",", 1)
+    return {"gpu_name": name.strip() or None, "driver_version": driver.strip() or None}
+
+
+def pytorch_versions() -> dict[str, str | None]:
+    empty = {"pytorch_version": None, "cuda_version": None}
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import torch; print(torch.__version__); print(torch.version.cuda or '')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return empty
+    if result.returncode != 0:
+        return empty
+    lines = [line.strip() for line in result.stdout.splitlines()]
+    if not lines:
+        return empty
+    cuda = lines[1] if len(lines) > 1 and lines[1] else None
+    return {"pytorch_version": lines[0] or None, "cuda_version": cuda}
 
 
 def _published_ttft(timings: dict[str, Any]) -> float:
@@ -241,37 +390,46 @@ def run_completion(
         },
     )
     finished = time.perf_counter()
+    measured = metrics_from_response(response)
+    measured["response"] = response
+    measured["wall_seconds"] = finished - started
+    return measured
+
+
+def metrics_from_response(response: dict[str, Any]) -> dict[str, Any]:
     usage = response["usage"]
     details = usage.get("prompt_tokens_details") or {}
-    if "cached_tokens" not in details:
+    cached = details.get("cached_tokens")
+    if cached is None:
         raise RuntimeError("Response is missing cached_tokens.")
     timings = response.get("timings")
     metrics = response.get("metrics")
+    completion_tokens = int(usage["completion_tokens"])
     if timings is not None:
         ttft = _published_ttft(timings)
-        inter_token = _mean_inter_token(timings, usage["completion_tokens"])
-        gaps = list(timings.get("inter_token_seconds") or [])
+        inter_token = _mean_inter_token(timings, completion_tokens)
+        gaps = [float(gap) for gap in (timings.get("inter_token_seconds") or [])]
+        accepted = timings.get("accepted_tokens_per_step")
     elif metrics is None:
         raise RuntimeError("vLLM response is missing metrics.")
     else:
-        ttft = (float(metrics["queue_time_ms"]) + float(metrics["time_to_first_token_ms"])) / 1000
+        ttft = (
+            float(metrics["queue_time_ms"]) + float(metrics["time_to_first_token_ms"])
+        ) / 1000
         mean_itl = metrics.get("mean_itl_ms")
         inter_token = None if mean_itl is None else float(mean_itl) / 1000
         gaps = []
         timings = {}
+        accepted = None
     return {
-        "response": response,
-        "wall_seconds": finished - started,
-        "prompt_tokens": usage["prompt_tokens"],
-        "completion_tokens": usage["completion_tokens"],
-        "cached_tokens": details["cached_tokens"],
+        "prompt_tokens": int(usage["prompt_tokens"]),
+        "completion_tokens": completion_tokens,
+        "cached_tokens": int(cached),
         "timings": timings,
         "ttft": ttft,
         "inter_token": inter_token,
         "gaps": gaps,
-        "accepted_tokens_per_step": (
-            None if timings is None else timings.get("accepted_tokens_per_step")
-        ),
+        "accepted_tokens_per_step": accepted,
     }
 
 
@@ -351,6 +509,29 @@ def _wait_health(base_url: str, timeout: float) -> dict[str, Any]:
     raise RuntimeError(f"pylon /health was not ready at {base_url}.") from last_error
 
 
+def _wait_vllm(base_url: str, timeout: float) -> dict[str, Any]:
+    deadline = time.perf_counter() + timeout
+    health = f"{base_url.rstrip('/')}/health"
+    while time.perf_counter() < deadline:
+        if http_ok(health, timeout=5):
+            version_body = request_json(
+                base_url, "/version", timeout=timeout, system="vllm"
+            )
+            version = str(version_body.get("version") or "")
+            if version != VLLM_VERSION:
+                raise RuntimeError(
+                    f"vLLM reported version {version or 'unknown'}; "
+                    f"{VLLM_VERSION} is required."
+                )
+            models = request_json(base_url, "/v1/models", timeout=timeout, system="vllm")
+            data = models.get("data") or []
+            if not data or "id" not in data[0]:
+                raise RuntimeError("vLLM /v1/models did not report a model id.")
+            return {"model": str(data[0]["id"]), "vllm_version": version}
+        time.sleep(1)
+    raise RuntimeError(f"vLLM /health was not ready at {base_url}.")
+
+
 def system_environ(base: dict[str, str], system: str) -> dict[str, str]:
     env = dict(base)
     if system == "eager":
@@ -361,6 +542,7 @@ def system_environ(base: dict[str, str], system: str) -> dict[str, str]:
     elif system == "pylon":
         env["PYLON_CUDA_GRAPHS"] = "true"
         env["PYLON_PREFIX_CACHE"] = "false"
+        env["PYLON_SPECULATE_K"] = "4"
         env["PYLON_ADMIT_SKIP"] = "4"
     return env
 
@@ -385,48 +567,71 @@ def result_flags(
     }
 
 
+def reuse_running_server(systems: list[str], system: str) -> bool:
+    return len(systems) == 1 and system != "vllm"
+
+
+def stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
+
+
 def _spawn_system(system: str) -> tuple[subprocess.Popen[bytes], str]:
     if system == "vllm":
-        command = [
-            "vllm",
-            "serve",
-            "Qwen/Qwen3-4B-Instruct-2507",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8001",
-            "--dtype",
-            "bfloat16",
-            "--tensor-parallel-size",
-            "1",
-            "--max-model-len",
-            "4096",
-            "--gpu-memory-utilization",
-            "0.90",
-            "--enable-prefix-caching",
-            "--enable-per-request-metrics",
-        ]
+        command = list(VLLM_ARGV)
         env = os.environ.copy()
-        url = "http://127.0.0.1:8001"
+        url = VLLM_URL
     else:
         env = system_environ(os.environ.copy(), system)
-        command = ["python", "-m", "pylon"]
+        command = [sys.executable, "-m", "pylon"]
         url = "http://127.0.0.1:8000"
-    process = subprocess.Popen(command, cwd=ROOT, env=env)
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError as error:
+        if system == "vllm":
+            raise RuntimeError(
+                f"vLLM {VLLM_VERSION} was not found on PATH."
+            ) from error
+        raise RuntimeError("Cannot start pylon.") from error
     return process, url
+
+
+def hub_dir() -> Path:
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"])
+    home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    return home / "hub"
+
+
+def cached_snapshot_revision() -> str | None:
+    ref = hub_dir() / "models--Qwen--Qwen3-4B-Instruct-2507" / "refs" / "main"
+    if not ref.is_file():
+        return None
+    revision = ref.read_text().strip()
+    return revision or None
 
 
 def verify_prompt_tokens(revision: str | None, rows: list[WorkloadRow]) -> None:
     if not revision:
-        raise RuntimeError("pylon /health did not report a snapshot revision.")
-    home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    snapshot = (
-        home
-        / "hub"
-        / "models--Qwen--Qwen3-4B-Instruct-2507"
-        / "snapshots"
-        / revision
-    )
+        raise RuntimeError("Cannot tokenize workload rows without a snapshot revision.")
+    snapshot = hub_dir() / "models--Qwen--Qwen3-4B-Instruct-2507" / "snapshots" / revision
     tokenizer_path = snapshot / "tokenizer.json"
     template_path = snapshot / "tokenizer_config.json"
     if not tokenizer_path.is_file() or not template_path.is_file():
@@ -500,28 +705,146 @@ def _run_rows(
     return [sample for sample in samples if sample is not None]
 
 
+def decode_heavy_series(
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, list[tuple[int, float]]]]:
+    ttft: dict[str, list[tuple[int, float]]] = {}
+    throughput: dict[str, list[tuple[int, float]]] = {}
+    for record in records:
+        if record.get("workload") != "decode_heavy":
+            continue
+        system = str(record["system"])
+        concurrency = int(record["concurrency"])
+        summary = record["summary"]
+        p50 = summary["ttft_seconds"]["p50"]
+        if p50 is not None:
+            ttft.setdefault(system, []).append((concurrency, float(p50)))
+        rate = summary.get("output_tokens_per_second")
+        if rate is not None:
+            throughput.setdefault(system, []).append((concurrency, float(rate)))
+    return {"ttft": ttft, "throughput": throughput}
+
+
+def ordered_lines(points_by_system: dict[str, list[tuple[int, float]]]) -> list[str]:
+    return [name for name in LINE_ORDER if points_by_system.get(name)]
+
+
+def should_write_plots(args: argparse.Namespace, records: list[dict[str, Any]]) -> bool:
+    if args.limit or args.repeats < 3:
+        return False
+    seen: dict[str, set[int]] = {}
+    for record in records:
+        if record.get("workload") != "decode_heavy":
+            continue
+        seen.setdefault(str(record["system"]), set()).add(int(record["concurrency"]))
+    return all({1, 8, 16} <= seen.get(system, set()) for system in LINE_ORDER)
+
+
+def draw_comparison(
+    points_by_system: dict[str, list[tuple[int, float]]],
+    ylabel: str,
+    axis: Any,
+) -> None:
+    for system in ordered_lines(points_by_system):
+        points = sorted(points_by_system[system])
+        axis.plot(
+            [point[0] for point in points],
+            [point[1] for point in points],
+            marker="o",
+            label=system,
+        )
+    axis.set_xlabel("Concurrency")
+    axis.set_ylabel(ylabel)
+    ticks = sorted({point[0] for points in points_by_system.values() for point in points})
+    if ticks:
+        axis.set_xticks(ticks)
+    if ordered_lines(points_by_system):
+        axis.legend()
+
+
+def write_comparison_plots(
+    records: list[dict[str, Any]], directory: Path
+) -> list[Path]:
+    series = decode_heavy_series(records)
+    if not series["ttft"] and not series["throughput"]:
+        return []
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    directory.mkdir(parents=True, exist_ok=True)
+    specs = (
+        (
+            "ttft_vs_concurrency.png",
+            series["ttft"],
+            "Time to first token p50 (seconds)",
+        ),
+        (
+            "output_tokens_per_second_vs_concurrency.png",
+            series["throughput"],
+            "Output tokens per second",
+        ),
+    )
+    written: list[Path] = []
+    for filename, points, ylabel in specs:
+        figure, axis = plt.subplots()
+        try:
+            draw_comparison(points, ylabel, axis)
+            path = directory / filename
+            figure.savefig(path)
+        finally:
+            plt.close(figure)
+        written.append(path)
+    return written
+
+
 def main() -> None:
     args = parse_args()
     systems = _split_list(args.systems)
     workloads = _split_list(args.workload)
     concurrencies = [int(item) for item in _split_list(args.concurrency)]
+    identity = query_gpu_identity()
+    runtime = pytorch_versions()
     records = []
     for system in systems:
-        base_url = "http://127.0.0.1:8001" if system == "vllm" else args.base_url
-        existing = _health_ok(base_url, args.timeout) if system != "vllm" else None
+        base_url = VLLM_URL if system == "vllm" else args.base_url
+        existing = (
+            _health_ok(base_url, args.timeout)
+            if reuse_running_server(systems, system)
+            else None
+        )
         process = None
-        if existing is None:
-            process, base_url = _spawn_system(system)
-            health = _wait_health(base_url, args.timeout)
-        else:
-            health = existing
         try:
+            if existing is None:
+                process, base_url = _spawn_system(system)
+                health = (
+                    _wait_vllm(base_url, args.timeout)
+                    if system == "vllm"
+                    else _wait_health(base_url, args.timeout)
+                )
+            else:
+                health = existing
+            spawn_env = (
+                None if system == "vllm" else system_environ(os.environ.copy(), system)
+            )
+            scheduler = health.get("scheduler") or {}
+            if system == "vllm":
+                batch_cap = None
+                prefill_chunk = None
+            else:
+                batch_cap = scheduler.get("max_batch_size")
+                if batch_cap is None:
+                    batch_cap = int((spawn_env or {}).get("PYLON_MAX_BATCH_SIZE", "8"))
+                prefill_chunk = int(
+                    (spawn_env or {}).get("PYLON_PREFILL_CHUNK_SIZE", "256")
+                )
             model = health["model"]
             for workload_name in workloads:
                 path = WORKLOADS / f"{workload_name}.json"
                 rows = load_workload(path)
-                if system != "vllm":
-                    verify_prompt_tokens(health.get("model_revision"), rows)
+                revision = health.get("model_revision") or cached_snapshot_revision()
+                verify_prompt_tokens(revision, rows)
                 if args.limit:
                     rows = rows[: args.limit]
                 for concurrency in concurrencies:
@@ -534,7 +857,14 @@ def main() -> None:
                         top_p=1,
                         timeout=args.timeout,
                     )
-                    request_json(base_url, "/internal/profile/reset", timeout=args.timeout, payload={})
+                    if system != "vllm":
+                        request_json(
+                            base_url,
+                            "/internal/profile/reset",
+                            timeout=args.timeout,
+                            payload={},
+                            system=system,
+                        )
                     sampler = GpuSampler(process.pid if process is not None else None)
                     sampler.start()
                     started = time.perf_counter()
@@ -564,10 +894,17 @@ def main() -> None:
                         elapsed = time.perf_counter() - started
                         sampler.stop()
                     summary = summarize(samples, elapsed)
-                    after = request_json(base_url, "/health", timeout=args.timeout)
-                    summary["peak_reserved_bytes"] = after.get("peak_reserved_bytes")
+                    peak_reserved = None
+                    if system != "vllm":
+                        after = request_json(
+                            base_url, "/health", timeout=args.timeout, system=system
+                        )
+                        peak_reserved = after.get("peak_reserved_bytes")
+                    summary["peak_reserved_bytes"] = peak_reserved
                     summary["peak_gpu_memory_bytes"] = sampler.peak_bytes
-                    _print_summary(system, workload_name, concurrency, summary, sampler.peak_bytes)
+                    _print_summary(
+                        system, workload_name, concurrency, summary, sampler.peak_bytes
+                    )
                     records.append(
                         {
                             "schema_version": 1,
@@ -578,36 +915,46 @@ def main() -> None:
                             "repeats": args.repeats,
                             "limit": args.limit,
                             "git_revision": git_revision(),
-                            "gpu_name": (health.get("memory") or {}).get("gpu"),
+                            "gpu_name": (health.get("memory") or {}).get("gpu")
+                            or identity["gpu_name"],
                             "model_id": model,
-                            "snapshot_revision": health.get("model_revision"),
+                            "snapshot_revision": revision,
                             "dataset_sha256": dataset_sha256(path),
+                            "batch_cap": batch_cap,
+                            "prefill_chunk_size": prefill_chunk,
+                            "vllm_version": health.get("vllm_version"),
+                            "vllm_argv": list(VLLM_ARGV) if system == "vllm" else None,
                             "summary": summary,
-                            "flags": result_flags(
-                                system,
-                                None
-                                if system == "vllm"
-                                else system_environ(os.environ.copy(), system),
-                            ),
+                            "flags": result_flags(system, spawn_env),
                             "samples": samples,
                         }
                     )
         finally:
             if process is not None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                stop_process(process)
+    if should_write_plots(args, records):
+        for plot in write_comparison_plots(records, PLOTS):
+            print(f"wrote {plot}", flush=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     safe = "".join(char if char.isalnum() or char in "-_" else "-" for char in args.label)
     path = RESULTS / f"{stamp}-{safe}.json"
+    observed_vllm = next(
+        (record.get("vllm_version") for record in records if record["system"] == "vllm"),
+        None,
+    )
     record = {
         "schema_version": 1,
         "timestamp": datetime.now(UTC).isoformat(),
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
+        "command": sys.argv,
+        "pytorch_version": runtime["pytorch_version"],
+        "cuda_version": runtime["cuda_version"],
+        "driver_version": identity["driver_version"],
+        "gpu_name": identity["gpu_name"],
+        "vllm_version": observed_vllm,
+        "vllm_argv": list(VLLM_ARGV) if "vllm" in systems else None,
         "runs": records,
     }
     path.write_text(json.dumps(record, indent=2) + "\n")

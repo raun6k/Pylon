@@ -10,6 +10,7 @@ dependencies = [
     "fastapi",
     "huggingface-hub",
     "jinja2",
+    "matplotlib",
     "numpy",
     "python-dotenv",
     "safetensors",

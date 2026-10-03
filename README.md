@@ -37,6 +37,18 @@ uv run python benchmarks/run.py \
 
 That command is a pipeline check. It is not a published latency result. Tables in this README are written by the benchmark harness. A number is not added by hand.
 
+The comparison command starts eager, then this server, then vLLM 0.30.0. It stops each process before the next one starts. vLLM is a subprocess. It is not imported.
+
+```bash
+uv run python benchmarks/run.py \
+  --systems eager,pylon,vllm \
+  --workload decode_heavy,prefill_heavy,shared_prefix \
+  --concurrency 1,8,16 \
+  --repeats 3
+```
+
+That command writes its table to stdout, a result file under `benchmarks/results/`, and two plots from the `decode_heavy` rows: `benchmarks/plots/ttft_vs_concurrency.png` and `benchmarks/plots/output_tokens_per_second_vs_concurrency.png`. This README does not include those plots or a latency number until that command has written the files.
+
 ## License
 
 Apache-2.0. See `LICENSE`.
