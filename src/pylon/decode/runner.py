@@ -287,6 +287,47 @@ class Decoder:
             finally:
                 batch.caches = ()
 
+    def verify_drafts(
+        self, caches: list[PagedKVCache], chunks: list[list[int]]
+    ) -> list[torch.Tensor]:
+        if (
+            not caches
+            or len(caches) != len(chunks)
+            or any(not chunk for chunk in chunks)
+        ):
+            raise ValueError("Each verified sequence needs at least one query token.")
+        if len({id(cache) for cache in caches}) != len(caches) or any(
+            not isinstance(cache, PagedKVCache) or cache.pool is not caches[0].pool
+            for cache in caches
+        ):
+            raise ValueError("Verified caches must be distinct and share a page pool.")
+        with torch.inference_mode():
+            batch = self._packed_batch
+            if batch is None or batch.pool is not caches[0].pool:
+                batch = self._packed_batch = PackedBatchCache(caches)
+            batch.caches, batch.batch_size = tuple(caches), len(caches)
+            try:
+                tokens = batch.metadata(
+                    "token_ids",
+                    [token for chunk in chunks for token in chunk],
+                    torch.long,
+                ).unsqueeze(0)
+                batch.prepare_packed([len(chunk) for chunk in chunks])
+                flat = self.model(tokens, cache=batch, every_position=True)
+            finally:
+                batch.caches = ()
+        if flat.ndim != 2 or flat.shape[0] != sum(len(chunk) for chunk in chunks):
+            raise RuntimeError(
+                "Draft verification did not return one logit row per query token."
+            )
+        rows: list[torch.Tensor] = []
+        offset = 0
+        for chunk in chunks:
+            count = len(chunk)
+            rows.append(flat[offset : offset + count])
+            offset += count
+        return rows
+
     def _decode_dense(
         self, tokens: torch.Tensor, caches: list[KVCache]
     ) -> torch.Tensor:

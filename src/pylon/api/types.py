@@ -74,6 +74,7 @@ class ChatCompletionTimings(BaseModel):
     prefill_tokens_per_second: float | None
     decode_tokens_per_second: float | None
     cache_hit_rate: float
+    accepted_tokens_per_step: tuple[int, ...] | None = None
 
 
 class ChatCompletionResponse(BaseModel):

@@ -98,6 +98,21 @@ class PagedKVCache:
         self.length = 0
         self._pending_tokens = None
 
+    def rewind(self, tokens: int) -> None:
+        if tokens == 0:
+            return
+        if (
+            isinstance(tokens, bool)
+            or not isinstance(tokens, int)
+            or tokens < 0
+            or tokens > self.length
+            or self._pending_tokens is not None
+        ):
+            raise ValueError("Paged KV rewind does not match the resident tokens.")
+        self.length -= tokens
+        keep = _pages_for(self.length, self.pool.page_size)
+        del self.pages[keep:]
+
 
 class PagedBatchCache:
     graph_static = False

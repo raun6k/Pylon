@@ -269,6 +269,9 @@ def run_completion(
         "ttft": ttft,
         "inter_token": inter_token,
         "gaps": gaps,
+        "accepted_tokens_per_step": (
+            None if timings is None else timings.get("accepted_tokens_per_step")
+        ),
     }
 
 
@@ -292,18 +295,37 @@ def summarize(samples: list[dict[str, Any]], elapsed_seconds: float) -> dict[str
         "prefill_tokens_computed": prefill_computed,
         "completion_tokens": completion_tokens,
         "elapsed_seconds": elapsed_seconds,
+        "mean_accepted_tokens": _mean_accepted(samples),
     }
+
+
+def _mean_accepted(samples: list[dict[str, Any]]) -> float | None:
+    steps = [
+        int(count)
+        for sample in samples
+        for count in (sample.get("accepted_tokens_per_step") or ())
+    ]
+    if not steps:
+        return None
+    return sum(steps) / len(steps)
 
 
 def _print_summary(system: str, workload: str, concurrency: int, summary: dict[str, Any], peak: int | None) -> None:
     ttft = summary["ttft_seconds"]
     inter = summary["inter_token_seconds"]
     peak_text = "—" if peak is None else str(peak)
+    acceptance = summary.get("mean_accepted_tokens")
+    acceptance_text = (
+        ""
+        if acceptance is None
+        else f" mean_accepted_tokens={acceptance:.4f}"
+    )
     print(
         f"{system} {workload} c={concurrency} "
         f"ttft_p50={ttft['p50']} ttft_p99={ttft['p99']} "
         f"inter_token_p50={inter['p50']} inter_token_p99={inter['p99']} "
-        f"output_tokens_per_second={summary['output_tokens_per_second']:.4f} "
+        f"output_tokens_per_second={summary['output_tokens_per_second']:.4f}"
+        f"{acceptance_text} "
         f"prefill_tokens_computed={summary['prefill_tokens_computed']} "
         f"peak_gpu_memory_bytes={peak_text}",
         flush=True,
@@ -334,16 +356,22 @@ def system_environ(base: dict[str, str], system: str) -> dict[str, str]:
     if system == "eager":
         env["PYLON_CUDA_GRAPHS"] = "false"
         env["PYLON_PREFIX_CACHE"] = "false"
+        env["PYLON_SPECULATE_K"] = "1"
     elif system == "pylon":
         env["PYLON_CUDA_GRAPHS"] = "true"
         env["PYLON_PREFIX_CACHE"] = "false"
     return env
 
 
-def result_flags(system: str) -> dict[str, object]:
+def result_flags(
+    system: str, env: dict[str, str] | None = None
+) -> dict[str, object]:
+    speculate_k = 1
+    if env is not None and "PYLON_SPECULATE_K" in env:
+        speculate_k = int(env["PYLON_SPECULATE_K"])
     return {
         "cuda_graphs": system == "pylon",
-        "speculation": False,
+        "speculation": speculate_k > 1,
         "prefix_cache": system not in {"eager", "pylon"},
         "admit_skip": 0,
     }
@@ -547,7 +575,12 @@ def main() -> None:
                             "snapshot_revision": health.get("model_revision"),
                             "dataset_sha256": dataset_sha256(path),
                             "summary": summary,
-                            "flags": result_flags(system),
+                            "flags": result_flags(
+                                system,
+                                None
+                                if system == "vllm"
+                                else system_environ(os.environ.copy(), system),
+                            ),
                             "samples": samples,
                         }
                     )

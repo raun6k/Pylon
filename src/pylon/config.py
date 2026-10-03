@@ -23,6 +23,7 @@ class PylonConfig:
     compile_fullgraph: bool = False
     compile_diagnostics: bool = True
     cuda_graphs: bool = False
+    speculate_k: int = 1
 
     def __post_init__(self) -> None:
         if (
@@ -59,6 +60,12 @@ class PylonConfig:
             raise ValueError("batch_wait_ms must be finite and non-negative.")
         if self.compile_fullgraph and not self.torch_compile:
             raise ValueError("compile_fullgraph requires torch_compile.")
+        if (
+            isinstance(self.speculate_k, bool)
+            or not isinstance(self.speculate_k, int)
+            or not 1 <= self.speculate_k <= 4
+        ):
+            raise ValueError("speculate_k must be an integer from 1 to 4.")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -93,4 +100,5 @@ def get_config() -> PylonConfig:
         compile_fullgraph=_env_bool("PYLON_COMPILE_FULLGRAPH", False),
         compile_diagnostics=_env_bool("PYLON_COMPILE_DIAGNOSTICS", True),
         cuda_graphs=_env_bool("PYLON_CUDA_GRAPHS", False),
+        speculate_k=int(os.getenv("PYLON_SPECULATE_K", "1")),
     )

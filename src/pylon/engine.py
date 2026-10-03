@@ -20,6 +20,7 @@ from pylon.prefix.cache import (
 from pylon.scheduler.admit import admit_requests
 from pylon.scheduler.batch import one_prefill_chunk
 from pylon.scheduler.queue import Job, Scheduler
+from pylon.spec.ngram import PromptNgram, accept_greedy, verification_tokens
 
 logger = logging.getLogger("pylon")
 PAGE_SIZE = 256
@@ -70,6 +71,7 @@ class GenerationResult:
     first_token_seconds: float | None = None
     token_intervals: tuple[float, ...] | None = None
     elapsed_seconds: float | None = None
+    accepted_tokens_per_step: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ class _ActiveRequest:
     first_token_at: float | None = None
     last_token_at: float | None = None
     token_intervals: list[float] = field(default_factory=list)
+    prompt_ngram: PromptNgram | None = None
+    accepted_tokens_per_step: list[int] = field(default_factory=list)
 
 
 class Engine:
@@ -118,6 +122,7 @@ class Engine:
         self.model_id = config.model_id
         self._config = config
         self.prefix_cache_enabled = config.prefix_cache
+        self._speculate_k = config.speculate_k
         self._prefill_chunk_size = config.prefill_chunk_size
         self._max_batch_size = config.max_batch_size
         self._memory_checker = None
@@ -256,11 +261,7 @@ class Engine:
             if active.pending_token_id is not None
         ]
         if decoding:
-            self._execute_batch(
-                decoding,
-                [[active.pending_token_id] for active in decoding],
-                decode=True,
-            )
+            self._run_decode_wave(decoding)
         now = time.perf_counter()
         if skip_prefill_wave(
             len(decoding),
@@ -317,6 +318,9 @@ class Engine:
                     request.input_ids,
                     self.prefix_cache.block_size,
                     prefix_hit,
+                ),
+                prompt_ngram=(
+                    PromptNgram(request.input_ids) if self._speculate_k > 1 else None
                 ),
             )
             self._active_requests.append(active)
@@ -415,8 +419,122 @@ class Engine:
                 active.inter_token_seconds.append(elapsed)
         removed = set()
         for active, token_id in zip(ready, token_ids, strict=True):
-            if not self._accept_token(active, int(token_id), active.queue_seconds, sampled_at):
+            token_id = int(token_id)
+            if self._speculate_k > 1 and active.pending_token_id is not None:
+                active.accepted_tokens_per_step.append(
+                    0 if token_id in active.request.stop_ids else 1
+                )
+            if not self._accept_token(active, token_id, active.queue_seconds, sampled_at):
                 removed.add(id(active))
+        self._active_requests = [
+            active for active in self._active_requests if id(active) not in removed
+        ]
+        self.prefix_cache.reserve(self._reserved_memory_bytes())
+
+    def _run_decode_wave(self, decoding: list[_ActiveRequest]) -> None:
+        if self._speculate_k <= 1:
+            self._execute_batch(
+                decoding,
+                [[active.pending_token_id] for active in decoding],
+                decode=True,
+            )
+            return
+        misses: list[_ActiveRequest] = []
+        hits: list[tuple[_ActiveRequest, tuple[int, ...]]] = []
+        for active in decoding:
+            drafts = self._prompt_drafts(active)
+            if drafts:
+                hits.append((active, drafts))
+            else:
+                misses.append(active)
+        if misses:
+            self._execute_batch(
+                misses,
+                [[active.pending_token_id] for active in misses],
+                decode=True,
+            )
+        if hits:
+            self._verify_drafts(hits)
+
+    def _prompt_drafts(self, active: _ActiveRequest) -> tuple[int, ...]:
+        if active.request.sampling.temperature != 0 or active.prompt_ngram is None:
+            return ()
+        remaining = active.request.sampling.max_new_tokens - len(active.output_ids)
+        room = active.cache.capacity - active.cache.length
+        limit = min(self._speculate_k, remaining, room)
+        if limit < 1:
+            return ()
+        return active.prompt_ngram.propose(
+            (*active.request.input_ids, *active.output_ids),
+            limit,
+        )
+
+    def _verify_drafts(self, hits: list[tuple[_ActiveRequest, tuple[int, ...]]]) -> None:
+        selected = [active for active, _drafts in hits]
+        proposals = [drafts for _active, drafts in hits]
+        queries = []
+        for active, drafts in hits:
+            pending = active.pending_token_id
+            if pending is None:
+                raise RuntimeError("Draft verification requires a pending token.")
+            queries.append(verification_tokens(pending, drafts))
+        started = time.perf_counter()
+        device = self.decoder.device
+        events = None
+        if device.type == "cuda":
+            stream = torch.cuda.current_stream(device)
+            if self._decode_events is None:
+                self._decode_events = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+            events = self._decode_events
+            events[0].record(stream)
+        logit_rows = self.decoder.verify_drafts(
+            [active.cache for active in selected],
+            queries,
+        )
+        if events is not None:
+            events[1].record(stream)
+        self._publish_resident_blocks()
+        sampled_at = time.perf_counter()
+        elapsed = (
+            events[0].elapsed_time(events[1]) / 1_000
+            if events is not None
+            else time.perf_counter() - started
+        )
+        for active in selected:
+            active.inter_token_seconds.append(elapsed)
+        removed: set[int] = set()
+        for active, drafts, query, logits in zip(
+            selected, proposals, queries, logit_rows, strict=True
+        ):
+            greedy = [int(token) for token in logits.argmax(dim=-1).tolist()]
+            accepted = accept_greedy(greedy, drafts)
+            appended: list[int] = []
+            stop_id = None
+            for token_id in accepted:
+                if token_id in active.request.stop_ids:
+                    stop_id = token_id
+                    break
+                appended.append(token_id)
+            active.accepted_tokens_per_step.append(len(appended))
+            finished = False
+            for token_id in appended:
+                if not self._accept_token(
+                    active, token_id, active.queue_seconds, sampled_at
+                ):
+                    finished = True
+                    break
+            if stop_id is not None and not finished:
+                self._accept_token(active, stop_id, active.queue_seconds, sampled_at)
+                finished = True
+            if finished:
+                removed.add(id(active))
+                continue
+            rewind = len(query) - len(appended)
+            if rewind:
+                active.cache.rewind(rewind)
         self._active_requests = [
             active for active in self._active_requests if id(active) not in removed
         ]
@@ -530,6 +648,11 @@ class Engine:
                 hit_tokens=active.hit_tokens,
                 restored_tokens=active.restored_tokens,
                 stored_blocks=stored_blocks,
+            ),
+            accepted_tokens_per_step=(
+                tuple(active.accepted_tokens_per_step)
+                if self._speculate_k > 1
+                else None
             ),
         )
         if not active.job.future.done():

@@ -28,6 +28,7 @@ class ChatGeneration:
     elapsed_seconds: float | None = None
     decode_compute_seconds: float = 0.0
     inter_token_seconds: tuple[float, ...] = ()
+    accepted_tokens_per_step: tuple[int, ...] | None = None
 
     @property
     def time_to_first_token_seconds(self) -> float:
@@ -153,6 +154,7 @@ class TextGenerator:
                 else None
             ),
             store_seconds=result.store_seconds,
+            accepted_tokens_per_step=result.accepted_tokens_per_step,
         )
 
     def warm_up(self) -> None:

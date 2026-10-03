@@ -107,5 +107,6 @@ async def chat_completions(
             prefill_tokens_per_second=result.prefill_tokens_per_second,
             decode_tokens_per_second=result.decode_tokens_per_second,
             cache_hit_rate=result.cache_hit_rate,
+            accepted_tokens_per_step=result.accepted_tokens_per_step,
         ),
     )

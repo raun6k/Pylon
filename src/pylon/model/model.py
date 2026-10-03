@@ -35,9 +35,16 @@ class Qwen3Model(nn.Module):
         cache: KVCache | BatchedKVCache | PagedBatchCache | None = None,
         position_ids: torch.Tensor | None = None,
         cache_slots: Sequence[int] | torch.Tensor | None = None,
+        every_position: bool = False,
     ) -> torch.Tensor:
         if isinstance(cache, PackedBatchCache):
-            return self._forward_packed(input_ids, cache)
+            return self._forward_packed(
+                input_ids, cache, every_position=every_position
+            )
+        if every_position:
+            raise ValueError(
+                "Logits at every query position require a packed forward."
+            )
         if cache_slots is None:
             return self._forward_uniform_cache(input_ids, cache, position_ids)
 
@@ -96,7 +103,11 @@ class Qwen3Model(nn.Module):
         return self.output(self.final_norm(x).to(self.config.dtype))
 
     def _forward_packed(
-        self, input_ids: torch.Tensor, cache: PackedBatchCache
+        self,
+        input_ids: torch.Tensor,
+        cache: PackedBatchCache,
+        *,
+        every_position: bool = False,
     ) -> torch.Tensor:
         if input_ids.shape != (1, sum(cache.counts)):
             raise ValueError("Packed input does not match query lengths.")
@@ -112,6 +123,8 @@ class Qwen3Model(nn.Module):
                 position_ids=cache.positions,
             )
         cache.advance_packed()
+        if every_position:
+            return self.output(self.final_norm(x).to(self.config.dtype))[0]
         x = x.index_select(1, cache.last_indices)
         return self.output(self.final_norm(x).to(self.config.dtype))[0]
 
