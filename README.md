@@ -25,6 +25,8 @@ On one NVIDIA L4, CUDA-graph decode beat this server's own eager path. Output sp
 | 8 | off | 176.0 | 237.7 | 695.5 | 44.4 | 19.77 GiB |
 | 8 | on | 184.9 | 233.4 | 678.6 | 42.3 | 19.94 GiB |
 
+CUDA-graph decode on `decode_heavy` raised output tokens per second from 24.7970 to 26.1710 at concurrency 1 and from 176.0118 to 184.8867 at concurrency 8, which is 5.54% and 5.04% over the eager rows in `benchmarks/results/20261003T153549Z-graph-decode-heavy.json`. Inter-token p50 fell from 0.04026 s to 0.03815 s and from 0.04441 s to 0.04226 s, while time to first token p50 went from 0.05110 s to 0.05159 s at concurrency 1 and from 0.23770 s to 0.23339 s at concurrency 8. Every row still computed 12288 prefill tokens, and peak GPU memory rose from 21225275392 bytes to 21407727616 bytes.
+
 Benchmark setup: NVIDIA L4, Qwen/Qwen3-4B-Instruct-2507 snapshot `cdbee75f17c01a7cc42f958dc650907174af0554`, PyTorch 2.14.1+cu130, CUDA 13.0, driver 595.58.03, batch cap 8, prefill chunk 256, 32 requests, 3 repeats. `eager` means graphs off and `pylon` means graphs on.
 
 ## Requirements
