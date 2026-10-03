@@ -62,6 +62,21 @@ uv run python benchmarks/run.py \
 
 This runs against a server that is already up. It is not the published result.
 
+## Reproduce
+
+Needs an NVIDIA GPU with CUDA, Python 3.11+, and PyTorch 2.13+.
+
+```bash
+uv run python benchmarks/run.py \
+  --systems eager,pylon \
+  --workload decode_heavy \
+  --concurrency 1,8 \
+  --repeats 3 \
+  --label graph-decode-heavy
+```
+
+`eager` is graphs off. `pylon` is graphs on. Both leave speculation, the prefix cache, and admit-skip off. This writes the table above. It does not compare against another server.
+
 ## License
 
 Apache-2.0. See `LICENSE`.
