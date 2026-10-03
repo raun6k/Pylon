@@ -17,11 +17,32 @@ from pylon.prefix.cache import (
     describe_prompt_blocks,
 )
 from pylon.scheduler.admit import admit_requests
-from pylon.scheduler.batch import pack_tick
+from pylon.scheduler.batch import one_prefill_chunk
 from pylon.scheduler.queue import Job, Scheduler
 
 logger = logging.getLogger("pylon")
 PAGE_SIZE = 256
+FULL_BATCH_PREFILL_WAIT_SECONDS = 0.1
+
+
+def skip_prefill_wave(
+    decoding: int, max_batch_size: int, oldest_age: float | None
+) -> bool:
+    if decoding != max_batch_size or oldest_age is None:
+        return False
+    return oldest_age < FULL_BATCH_PREFILL_WAIT_SECONDS
+
+
+def oldest_prefill_age(active, now: float) -> float | None:
+    started = [
+        item.prefill_wait_started
+        for item in active
+        if item.pending_token_id is None
+        and item.prompt_offset < len(item.request.input_ids)
+    ]
+    if not started:
+        return None
+    return now - min(started)
 
 
 @dataclass(frozen=True)
@@ -217,7 +238,7 @@ class Engine:
             admit_requests(self)
             if self._active_requests:
                 try:
-                    self._run_mixed_batch()
+                    self._run_waves()
                 except Exception as error:
                     logger.exception("model_batch_failed")
                     self._fail_active_requests(error)
@@ -225,14 +246,32 @@ class Engine:
             scheduler.set_active(tuple(active.job for active in self._active_requests))
             return bool(self._active_requests or scheduler.peek() is not None)
 
-    def _run_mixed_batch(self) -> None:
-        selected, chunks = pack_tick(
-            self._active_requests,
-            self._prefill_chunk_size,
-            time.perf_counter(),
+    def _run_waves(self) -> None:
+        decoding = [
+            active
+            for active in self._active_requests
+            if active.pending_token_id is not None
+        ]
+        if decoding:
+            self._execute_batch(
+                decoding,
+                [[active.pending_token_id] for active in decoding],
+                decode=True,
+            )
+        now = time.perf_counter()
+        if skip_prefill_wave(
+            len(decoding),
+            self._max_batch_size,
+            oldest_prefill_age(self._active_requests, now),
+        ):
+            return
+        chosen = one_prefill_chunk(
+            self._active_requests, self._prefill_chunk_size, now
         )
-        if selected:
-            self._execute_batch(selected, chunks)
+        if chosen is None:
+            return
+        active, tokens = chosen
+        self._execute_batch([active], [tokens], decode=False)
 
     def _start_request(self, job: Job, reservation_bytes: int, reserved_memory_bytes: int) -> None:
         request = job.payload
@@ -288,7 +327,13 @@ class Engine:
                 job.future.set_exception(error)
             self.prefix_cache.reserve(self._reserved_memory_bytes())
 
-    def _execute_batch(self, selected: list[_ActiveRequest], chunks: list[list[int]]) -> None:
+    def _execute_batch(
+        self,
+        selected: list[_ActiveRequest],
+        chunks: list[list[int]],
+        *,
+        decode: bool,
+    ) -> None:
         started = time.perf_counter()
         device = self.decoder.device
         events = None
@@ -301,8 +346,7 @@ class Engine:
                 )
             events = self._decode_events
             events[0].record(stream)
-        decoding = [active for active in selected if active.pending_token_id is not None]
-        if len(decoding) == len(selected):
+        if decode:
             logits = self.decoder.decode_caches(
                 [active.cache for active in selected],
                 [chunk[0] for chunk in chunks],

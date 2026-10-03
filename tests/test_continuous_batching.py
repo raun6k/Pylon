@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,13 +9,13 @@ import torch
 
 from pylon.api.types import Sampling
 from pylon.config import PylonConfig
-from pylon.engine import Engine
+from pylon.engine import FULL_BATCH_PREFILL_WAIT_SECONDS, Engine, skip_prefill_wave
 from pylon.kv.budget import CacheCapacity, MemoryReport
 from pylon.kv.cache import PackedBatchCache, PagedBatchCache
 from pylon.kv.pool import KVPagePool
 from pylon.model.config import Qwen3Config
 from pylon.prefix.cache import hash_token_blocks
-from pylon.scheduler.batch import pack_tick
+from pylon.scheduler.batch import PREFILL_MAX_WAIT_SECONDS, pack_tick
 
 
 class FakeDecoder:
@@ -22,7 +23,9 @@ class FakeDecoder:
         self.model = SimpleNamespace(config=config)
         self.device = torch.device("cpu")
         self.page_pool: KVPagePool | None = None
+        self.graphs = None
         self.prefill_chunk_sizes: list[int] = []
+        self.forwards: list[tuple[str, list]] = []
         self._planned: list[int] = []
         self._token_for_cache: dict[int, int] = {}
 
@@ -61,13 +64,21 @@ class FakeDecoder:
     def packed_caches(self, caches: list, chunks: list[list[int]]) -> torch.Tensor:
         counts = [len(chunk) for chunk in chunks]
         self.prefill_chunk_sizes.extend(counts)
+        self.forwards.append(("prefill", [list(chunk) for chunk in chunks]))
         batch = PackedBatchCache(caches)
         batch.prepare_packed(counts)
         batch.advance_packed()
         return self._logits(caches)
 
     def decode_caches(self, caches: list, token_ids: list[int]) -> torch.Tensor:
-        del token_ids
+        self.forwards.append(("decode", [[token_id] for token_id in token_ids]))
+        if self.graphs is not None:
+            replayed = self.graphs.replay(caches, token_ids)
+            if replayed is not None:
+                batch = PagedBatchCache(caches)
+                batch.prepare(1)
+                batch.advance(1)
+                return replayed
         batch = PagedBatchCache(caches)
         batch.prepare(1)
         batch.advance(1)
@@ -174,6 +185,17 @@ class ContinuousBatchingTests(unittest.TestCase):
                 return
             self.tick(engine)
         self.fail("requests did not finish")
+
+    def activate_head(self, engine: Engine) -> None:
+        head = engine._scheduler.peek()
+        self.assertIsNotNone(head)
+        request = head.payload
+        capacity = len(request.input_ids) + request.sampling.max_new_tokens
+        reservation = engine.request_cache_bytes(capacity)
+        reserved = engine._reserved_memory_bytes(extra_capacity=capacity)
+        job = engine._scheduler.take(head)
+        self.assertIsNotNone(job)
+        engine._start_request(job, reservation, reserved)
 
     def test_prefill_stays_inside_the_chunk_bound(self) -> None:
         engine = self.make_engine(prefill_chunk_size=4)
@@ -291,6 +313,137 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.assertEqual(selected[1], aged)
         self.assertEqual(chunks[1], [2, 2, 2])
         self.assertNotIn(fresh, selected)
+
+    def test_one_tick_prefills_a_single_chunk(self) -> None:
+        engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=8)
+        first = self.enqueue(engine, "first", [1, 2, 3, 4], 1)
+        second = self.enqueue(engine, "second", [6, 7, 8, 9], 1)
+        self.tick(engine)
+        self.assertEqual(
+            [active.request.request_id for active in engine._active_requests],
+            ["second"],
+        )
+        self.assertEqual(engine._active_requests[0].prompt_offset, 0)
+        self.assertEqual(self.decoder.prefill_chunk_sizes, [4])
+        self.assertEqual(first.result(timeout=0).output_ids, [5])
+        self.assertEqual([name for name, _ in self.decoder.forwards], ["prefill"])
+
+    def test_prefill_chunk_is_not_shrunk_by_decode_tokens(self) -> None:
+        engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=4)
+        self.enqueue(engine, "decode", [1, 2, 3], 8)
+        self.enqueue(engine, "prefill", [4] * 12, 1)
+        self.tick(engine)
+        decode = engine._active_requests[0]
+        prefill = engine._active_requests[1]
+        self.assertEqual(decode.request.request_id, "decode")
+        self.assertIsNotNone(decode.pending_token_id)
+        self.assertEqual(prefill.prompt_offset, 0)
+        prefill_seconds = decode.prefill_seconds
+        intervals = len(decode.inter_token_seconds)
+        self.decoder.forwards.clear()
+        self.tick(engine)
+        self.assertEqual(
+            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
+        )
+        self.assertEqual(self.decoder.forwards[1][1], [[4, 4, 4, 4]])
+        self.assertEqual(prefill.prompt_offset, 4)
+        self.assertEqual(len(decode.inter_token_seconds), intervals + 1)
+        self.assertEqual(decode.prefill_seconds, prefill_seconds)
+        self.assertGreater(prefill.prefill_seconds, 0)
+
+    def test_decode_wave_replays_the_graph_and_prefill_stays_eager(self) -> None:
+        engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=4)
+        replayed: list[int] = []
+
+        class Graphs:
+            def replay(self, caches, token_ids):
+                del token_ids
+                replayed.append(len(caches))
+                return None
+
+        self.decoder.graphs = Graphs()
+        self.enqueue(engine, "decode", [1, 2, 3], 8)
+        self.enqueue(engine, "prefill", [4] * 12, 1)
+        self.tick(engine)
+        replayed.clear()
+        self.decoder.forwards.clear()
+        self.tick(engine)
+        self.assertEqual(replayed, [1])
+        self.assertEqual(
+            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
+        )
+
+    def test_full_decode_batch_holds_a_young_prefill(self) -> None:
+        engine = self.make_engine(slots=1, budget_tokens=4096, prefill_chunk_size=4)
+        self.enqueue(engine, "decode", [1, 2, 3], 8)
+        self.tick(engine)
+        self.enqueue(engine, "prefill", [4] * 12, 1)
+        self.activate_head(engine)
+        prefill = engine._active_requests[1]
+        prefill.prefill_wait_started = time.perf_counter()
+        self.decoder.forwards.clear()
+        self.tick(engine)
+        self.assertEqual(prefill.prompt_offset, 0)
+        self.assertIsNone(prefill.pending_token_id)
+        self.assertEqual([name for name, _ in self.decoder.forwards], ["decode"])
+
+    def test_full_decode_batch_prefills_a_prompt_that_waited_100ms(self) -> None:
+        engine = self.make_engine(slots=1, budget_tokens=4096, prefill_chunk_size=4)
+        self.enqueue(engine, "decode", [1, 2, 3], 8)
+        self.tick(engine)
+        self.enqueue(engine, "prefill", [4] * 12, 1)
+        self.activate_head(engine)
+        prefill = engine._active_requests[1]
+        prefill.prefill_wait_started = (
+            time.perf_counter() - FULL_BATCH_PREFILL_WAIT_SECONDS
+        )
+        self.decoder.forwards.clear()
+        self.tick(engine)
+        self.assertEqual(prefill.prompt_offset, 4)
+        self.assertEqual(
+            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
+        )
+        self.assertEqual(self.decoder.forwards[1][1], [[4, 4, 4, 4]])
+
+    def test_young_prefill_still_runs_when_the_decode_batch_is_not_full(self) -> None:
+        engine = self.make_engine(slots=2, budget_tokens=8192, prefill_chunk_size=4)
+        self.enqueue(engine, "decode", [1, 2, 3], 8)
+        self.enqueue(engine, "prefill", [4] * 12, 1)
+        self.tick(engine)
+        prefill = engine._active_requests[1]
+        prefill.prefill_wait_started = time.perf_counter()
+        self.decoder.forwards.clear()
+        self.tick(engine)
+        self.assertEqual(prefill.prompt_offset, 4)
+        self.assertEqual(
+            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
+        )
+
+    def test_aged_prefill_gets_the_only_chunk(self) -> None:
+        engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=4)
+        self.enqueue(engine, "decode", [1, 2, 3], 8)
+        self.enqueue(engine, "fresh", [7] * 12, 1)
+        self.enqueue(engine, "aged", [8] * 12, 1)
+        self.tick(engine)
+        fresh = engine._active_requests[1]
+        aged = engine._active_requests[2]
+        now = time.perf_counter()
+        fresh.prefill_wait_started = now - 0.01
+        aged.prefill_wait_started = now - PREFILL_MAX_WAIT_SECONDS
+        self.decoder.forwards.clear()
+        self.tick(engine)
+        self.assertEqual(fresh.prompt_offset, 0)
+        self.assertEqual(aged.prompt_offset, 4)
+        self.assertEqual(self.decoder.forwards[0][0], "decode")
+        self.assertEqual(self.decoder.forwards[1][1], [[8, 8, 8, 8]])
+
+    def test_skip_threshold_is_under_100ms_on_a_full_batch_only(self) -> None:
+        self.assertEqual(FULL_BATCH_PREFILL_WAIT_SECONDS, 0.1)
+        self.assertEqual(PREFILL_MAX_WAIT_SECONDS, 0.1)
+        self.assertTrue(skip_prefill_wave(8, 8, 0.099))
+        self.assertFalse(skip_prefill_wave(8, 8, 0.1))
+        self.assertFalse(skip_prefill_wave(8, 8, None))
+        self.assertFalse(skip_prefill_wave(7, 8, 0.0))
 
     def test_block_hash_is_chained_sha256_of_json(self) -> None:
         blocks = hash_token_blocks([(1, 2), (3,)])
