@@ -796,6 +796,14 @@ class Engine:
                 prefill_chunk_size=self._prefill_chunk_size,
             )
 
+    def apply_warmup_memory(self, *, warmup_peak_bytes: int, warmup_kv_bytes: int) -> None:
+        if self._memory_checker is None:
+            return
+        self.update_cache_capacity(
+            warmup_peak_bytes=warmup_peak_bytes,
+            warmup_kv_bytes=warmup_kv_bytes,
+        )
+
     def update_cache_capacity(self, *, warmup_peak_bytes: int, warmup_kv_bytes: int) -> None:
         if self._memory_checker is None:
             raise RuntimeError("Cannot reprofile KV memory without a CUDA memory check.")

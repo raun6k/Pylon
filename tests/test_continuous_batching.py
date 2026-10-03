@@ -8,6 +8,9 @@ import torch
 
 from benchmarks.run import result_flags, system_environ
 from pylon.api.types import Sampling
+from pylon.decode.runner import Decoder
+from pylon.frontend import TextGenerator
+from pylon.model.model import Qwen3Model
 from pylon.config import PylonConfig, get_config
 from pylon.engine import FULL_BATCH_PREFILL_WAIT_SECONDS, Engine, skip_prefill_wave
 from pylon.kv.budget import CacheCapacity, MemoryReport
@@ -101,6 +104,16 @@ class FakeDecoder:
         for row, cache in enumerate(caches):
             logits[row, self._token_for_cache[id(cache)]] = 10.0
         return logits
+
+
+class WarmupTokenizer:
+    stop_token_ids = ()
+
+    def encode_chat(self, messages: list[tuple[str, str]]) -> list[int]:
+        count = max(8, sum(len(content) for _, content in messages) // 4)
+        if len(messages) > 1:
+            count += 32
+        return [3] * count
 
 
 class ContinuousBatchingTests(unittest.TestCase):
@@ -331,6 +344,68 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.assertEqual(engine.prefix_cache.token_count, 0)
         self.assertEqual(engine.prefix_cache.sighted_hashes, frozenset())
         self.assertEqual(engine.prefix_cache.memory_bytes, 0)
+
+    def test_warmup_finishes_with_prefix_cache_disabled(self) -> None:
+        torch.manual_seed(0)
+        config = Qwen3Config(
+            vocab_size=64,
+            context_length=2048,
+            hidden_size=16,
+            n_heads=2,
+            n_layers=1,
+            hidden_dim=32,
+            head_dim=8,
+            n_kv_heads=1,
+            dtype=torch.float32,
+        )
+        model = Qwen3Model(config).eval()
+        element_size = torch.empty((), dtype=config.dtype).element_size()
+        bytes_per_token = (
+            config.n_layers * 2 * config.n_kv_heads * config.head_dim * element_size
+        )
+        budget_tokens = 2048
+        budget_bytes = budget_tokens * bytes_per_token
+        capacity = CacheCapacity(
+            free_bytes=budget_bytes,
+            device_occupied_bytes=0,
+            activation_headroom_bytes=0,
+            bytes_per_token=bytes_per_token,
+            max_tokens=budget_tokens,
+            kv_budget_bytes=budget_bytes,
+            model_occupied_bytes=0,
+        )
+        report = MemoryReport(
+            gpu="test-cpu",
+            total_bytes=budget_bytes,
+            max_gpu_utilization=1.0,
+            max_gpu_bytes=budget_bytes,
+            free_before_load_bytes=budget_bytes,
+            weight_bytes=0,
+            required_bytes=0,
+            fits=True,
+            cache=capacity,
+        )
+        with patch("pylon.scheduler.queue.Thread"):
+            engine = Engine(
+                PylonConfig(
+                    model_id="test-cpu",
+                    max_batch_size=1,
+                    prefill_chunk_size=256,
+                    batch_wait_ms=0,
+                    prefix_cache=False,
+                ),
+                decoder=Decoder(model),
+                capacity=capacity,
+                report=report,
+            )
+        self.addCleanup(engine.close)
+        generator = TextGenerator(WarmupTokenizer(), engine)
+        generator.warm_up()
+        health = generator.health()
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["warmup_batch_sizes"], [1])
+        self.assertEqual(engine.prefix_cache.token_count, 0)
+        self.assertFalse(engine.prefix_cache_enabled)
 
     def test_aged_prefill_takes_the_next_chunk(self) -> None:
         now = 1_000.0

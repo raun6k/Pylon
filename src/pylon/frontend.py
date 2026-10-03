@@ -194,7 +194,9 @@ class TextGenerator:
             run(input_ids, "startup-warmup-cold")
             run(input_ids, "startup-warmup-repeat")
             result = run(extended_ids, "startup-warmup-prefix")
-            if not 0 < result.prefix.restored_tokens < len(extended_ids) - 1:
+            if self.engine.prefix_cache_enabled and not (
+                0 < result.prefix.restored_tokens < len(extended_ids) - 1
+            ):
                 raise RuntimeError(
                     "Warmup must restore a prefix and prefill multiple new tokens."
                 )
@@ -219,7 +221,7 @@ class TextGenerator:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        self.engine.update_cache_capacity(
+        self.engine.apply_warmup_memory(
             warmup_peak_bytes=max(warmup_peak_bytes, decode_activation_bytes),
             warmup_kv_bytes=0,
         )

@@ -40,6 +40,9 @@ class DenseDecodeTests(unittest.TestCase):
             ])
 
     def test_dense_logits_match_independent_requests(self):
+        self._compare_independent_dense(atol=2e-5, rtol=2e-5)
+
+    def _compare_independent_dense(self, *, atol: float, rtol: float) -> None:
         decoder = Decoder(self.model)
         for batch_size in (1, 2, 3, 8):
             prompts = [[3] * (5 + row * 2) for row in range(batch_size)]
@@ -48,17 +51,22 @@ class DenseDecodeTests(unittest.TestCase):
             for _ in range(4):
                 expected = self.reference_decode(reference)
                 actual = decoder.decode_caches(caches, [4] * batch_size)
-                torch.testing.assert_close(expected, actual, atol=2e-5, rtol=2e-5)
+                torch.testing.assert_close(expected, actual, atol=atol, rtol=rtol)
             for a, b in zip(reference, caches, strict=True):
                 self.assertEqual(a.length, b.length)
                 for x, y in zip(a._layers, b._layers, strict=True):
-                    torch.testing.assert_close(x.keys, y.keys, atol=2e-5, rtol=2e-5)
-                    torch.testing.assert_close(x.values, y.values, atol=2e-5, rtol=2e-5)
+                    torch.testing.assert_close(x.keys, y.keys, atol=atol, rtol=rtol)
+                    torch.testing.assert_close(x.values, y.values, atol=atol, rtol=rtol)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda_dense_logits_match_independent_requests(self):
-        self.model.cuda()
-        self.test_dense_logits_match_independent_requests()
+        if not torch.cuda.is_bf16_supported() or not _bf16_dense_sdpa_runs():
+            self.skipTest(
+                "dense CUDA comparison needs a bfloat16 scaled-dot-product kernel; "
+                "float32 has no available kernel"
+            )
+        self.model = self.model.to(device="cuda", dtype=torch.bfloat16)
+        self._compare_independent_dense(atol=2e-2, rtol=2e-2)
 
     def test_dense_storage_survives_decode_and_membership_changes(self):
         eager = Decoder(self.model)
@@ -141,3 +149,35 @@ class DenseDecodeTests(unittest.TestCase):
             warm_decode(
                 decoder, [3] * 12, max_batch_size=3, max_tokens=128, budget_tokens=7
             )
+
+
+def _bf16_dense_sdpa_runs() -> bool:
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    try:
+        causal_query = torch.randn(1, 2, 4, 8, device=device, dtype=dtype)
+        causal_key = torch.randn(1, 1, 4, 8, device=device, dtype=dtype)
+        torch.nn.functional.scaled_dot_product_attention(
+            causal_query,
+            causal_key,
+            torch.randn_like(causal_key),
+            dropout_p=0.0,
+            is_causal=True,
+            enable_gqa=True,
+        )
+        mask = torch.ones(1, 1, 1, 6, device=device, dtype=torch.bool)
+        query = torch.randn(2, 2, 1, 8, device=device, dtype=dtype)
+        key = torch.randn(2, 1, 6, 8, device=device, dtype=dtype)
+        torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            torch.randn_like(key),
+            attn_mask=mask,
+            dropout_p=0.0,
+            enable_gqa=True,
+        )
+    except RuntimeError as error:
+        if "No available kernel" in str(error):
+            return False
+        raise
+    return True
