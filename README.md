@@ -65,11 +65,9 @@ In that command, `eager` is graphs off and `pylon` is graphs on.
 
 Output tokens per second is higher with graphs on, and inter-token p50 is lower, at both concurrencies. At concurrency 1, time to first token is higher with graphs on. At concurrency 8, time to first token is lower with graphs on. Peak GPU memory is 21407727616 bytes with graphs on and 21225275392 bytes with graphs off.
 
-![decode_heavy output tokens per second](benchmarks/plots/decode_heavy_output_tokens_per_second.png)
+<p><img src="benchmarks/plots/decode_heavy_output_tokens_per_second.png" alt="decode_heavy output tokens per second" width="46%">&nbsp;&nbsp;&nbsp;&nbsp;<img src="benchmarks/plots/decode_heavy_inter_token_p50.png" alt="decode_heavy inter-token p50" width="46%"></p>
 
-![decode_heavy inter-token p50](benchmarks/plots/decode_heavy_inter_token_p50.png)
-
-The inter-token chart uses the same p50 in milliseconds: 40.3 and 38.1 at concurrency 1, 44.4 and 42.3 at concurrency 8.
+Each figure has a chart for concurrency 1 and a chart for concurrency 8. Output tokens per second uses 20–28 at concurrency 1 and 170–186 at concurrency 8. Inter-token p50 uses 32–47 ms on both charts: 40.3 and 38.1 at concurrency 1, and 44.4 and 42.3 at concurrency 8.
 
 ## License
 
