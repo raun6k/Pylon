@@ -59,6 +59,7 @@ class Decoder:
     def __init__(self, model: Qwen3Model) -> None:
         self.model = model
         self.page_pool: KVPagePool | None = None
+        self.graphs = None
         self._paged_decode_batch: PagedBatchCache | None = None
         self._packed_batch: PackedBatchCache | None = None
 
@@ -219,16 +220,20 @@ class Decoder:
         if not caches or len(caches) != len(token_ids):
             raise ValueError("Every request cache needs exactly one pending token.")
         self.model.eval()
+        if isinstance(caches[0], PagedKVCache):
+            if any(
+                not isinstance(cache, PagedKVCache) or cache.pool is not caches[0].pool
+                for cache in caches
+            ):
+                raise ValueError("Paged decode caches must share one pool.")
+            if len({id(cache) for cache in caches}) != len(caches):
+                raise ValueError("Paged batches require distinct request caches.")
+            if self.graphs is not None:
+                replayed = self.graphs.replay(caches, token_ids)
+                if replayed is not None:
+                    return replayed
         with torch.inference_mode():
             if isinstance(caches[0], PagedKVCache):
-                if any(
-                    not isinstance(cache, PagedKVCache)
-                    or cache.pool is not caches[0].pool
-                    for cache in caches
-                ):
-                    raise ValueError("Paged decode caches must share one pool.")
-                if len({id(cache) for cache in caches}) != len(caches):
-                    raise ValueError("Paged batches require distinct request caches.")
                 batch = self._paged_decode_batch
                 if batch is None or batch.pool is not caches[0].pool:
                     batch = self._paged_decode_batch = PagedBatchCache(caches)

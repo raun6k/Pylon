@@ -100,6 +100,8 @@ class PagedKVCache:
 
 
 class PagedBatchCache:
+    graph_static = False
+
     def __init__(self, caches: Sequence[PagedKVCache]) -> None:
         if not caches:
             raise ValueError("Paged batch cache needs at least one request cache.")
@@ -143,7 +145,7 @@ class PagedBatchCache:
             "positions", [self.caches[row].length for row in rows], torch.long
         )
 
-    def prepare(self, tokens: int) -> None:
+    def reserve(self, tokens: int) -> None:
         if tokens < 1:
             raise ValueError("Paged KV append needs at least one token.")
         page_size = self.pool.page_size
@@ -163,6 +165,10 @@ class PagedBatchCache:
         for cache, missing in zip(self.caches, missing_pages, strict=True):
             cache.pages.extend(self.pool.acquire(missing))
             cache._pending_tokens = tokens
+
+    def prepare(self, tokens: int) -> None:
+        self.reserve(tokens)
+        page_size = self.pool.page_size
         tables = [[page.index for page in cache.pages] for cache in self.caches]
         width = max(_pages_for(cache.capacity, page_size) for cache in self.caches)
         signature = (width, tuple(tuple(table) for table in tables))

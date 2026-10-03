@@ -52,14 +52,20 @@ class Qwen3Model(nn.Module):
             raise ValueError(
                 f"The model supports at most {self.config.context_length:,} tokens per request."
             )
-        starts = cache.slot_lengths(cache_slots)
-        ends = starts + tokens
+        paged = isinstance(cache, PagedBatchCache)
+        starts = None
+        ends = None
+        if paged and cache.graph_static:
+            if position_ids is None:
+                raise ValueError("Decode graph capture requires position ids.")
+        else:
+            starts = cache.slot_lengths(cache_slots)
+            ends = starts + tokens
         x = self.token_embedding(input_ids)
         key_length = max(start + tokens for start in slot_starts)
         mask = None
         uniform_start = len(set(slot_starts)) == 1
         is_causal = False
-        paged = isinstance(cache, PagedBatchCache)
         if not paged and tokens > 1 and uniform_start:
             if slot_starts[0] == 0:
                 is_causal = True

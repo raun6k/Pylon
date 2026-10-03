@@ -166,6 +166,13 @@ class Engine:
     def scheduler_snapshot(self) -> dict[str, object]:
         return self._scheduler.snapshot()
 
+    @property
+    def cuda_graph_batch_sizes(self) -> tuple[int, ...]:
+        graphs = getattr(self.decoder, "graphs", None)
+        if graphs is None:
+            return ()
+        return tuple(graphs.captured_sizes())
+
     def prefix_cache_snapshot(self) -> dict[str, object]:
         with self._generation_lock:
             cache = self.prefix_cache
@@ -186,6 +193,8 @@ class Engine:
             self._active_requests = []
             self.prefix_cache.reserve(0)
             self.prefix_cache.clear()
+            if getattr(self.decoder, "graphs", None) is not None:
+                self.decoder.graphs = None
             self.decoder.page_pool = None
 
     def enqueue(
@@ -551,6 +560,21 @@ class Engine:
                     restored_tokens=decoded.restored_tokens,
                     stored_blocks=stored_blocks,
                 ),
+            )
+
+    def capture_decode_graphs(self, input_ids: list[int]) -> tuple[int, ...]:
+        if not self._config.cuda_graphs or self.decoder.device.type != "cuda":
+            return ()
+        from pylon.decode.warmup import capture_decode_graphs
+
+        with self._generation_lock:
+            if self._active_requests:
+                raise RuntimeError("Cannot capture CUDA graphs while requests are active.")
+            return capture_decode_graphs(
+                self.decoder,
+                token_id=int(input_ids[-1]),
+                max_batch_size=self._max_batch_size,
+                max_tokens=self.capacity.max_tokens,
             )
 
     def warm_decode(self, input_ids: list[int]) -> tuple[int, tuple[int, ...]]:

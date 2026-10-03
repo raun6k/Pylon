@@ -22,6 +22,7 @@ class PylonConfig:
     torch_compile: bool = False
     compile_fullgraph: bool = False
     compile_diagnostics: bool = True
+    cuda_graphs: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -91,4 +92,5 @@ def get_config() -> PylonConfig:
         torch_compile=_env_bool("PYLON_TORCH_COMPILE", False),
         compile_fullgraph=_env_bool("PYLON_COMPILE_FULLGRAPH", False),
         compile_diagnostics=_env_bool("PYLON_COMPILE_DIAGNOSTICS", True),
+        cuda_graphs=_env_bool("PYLON_CUDA_GRAPHS", False),
     )

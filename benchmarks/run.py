@@ -329,6 +329,26 @@ def _wait_health(base_url: str, timeout: float) -> dict[str, Any]:
     raise RuntimeError(f"pylon /health was not ready at {base_url}.") from last_error
 
 
+def system_environ(base: dict[str, str], system: str) -> dict[str, str]:
+    env = dict(base)
+    if system == "eager":
+        env["PYLON_CUDA_GRAPHS"] = "false"
+        env["PYLON_PREFIX_CACHE"] = "false"
+    elif system == "pylon":
+        env["PYLON_CUDA_GRAPHS"] = "true"
+        env["PYLON_PREFIX_CACHE"] = "false"
+    return env
+
+
+def result_flags(system: str) -> dict[str, object]:
+    return {
+        "cuda_graphs": system == "pylon",
+        "speculation": False,
+        "prefix_cache": system not in {"eager", "pylon"},
+        "admit_skip": 0,
+    }
+
+
 def _spawn_system(system: str) -> tuple[subprocess.Popen[bytes], str]:
     if system == "vllm":
         command = [
@@ -353,8 +373,7 @@ def _spawn_system(system: str) -> tuple[subprocess.Popen[bytes], str]:
         env = os.environ.copy()
         url = "http://127.0.0.1:8001"
     else:
-        env = os.environ.copy()
-        env["PYLON_PREFIX_CACHE"] = "false" if system == "eager" else env.get("PYLON_PREFIX_CACHE", "true")
+        env = system_environ(os.environ.copy(), system)
         command = ["python", "-m", "pylon"]
         url = "http://127.0.0.1:8000"
     process = subprocess.Popen(command, cwd=ROOT, env=env)
@@ -528,12 +547,7 @@ def main() -> None:
                             "snapshot_revision": health.get("model_revision"),
                             "dataset_sha256": dataset_sha256(path),
                             "summary": summary,
-                            "flags": {
-                                "cuda_graphs": False,
-                                "speculation": False,
-                                "prefix_cache": system != "eager",
-                                "admit_skip": 0,
-                            },
+                            "flags": result_flags(system),
                             "samples": samples,
                         }
                     )

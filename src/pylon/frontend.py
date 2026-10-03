@@ -220,6 +220,7 @@ class TextGenerator:
             warmup_peak_bytes=max(warmup_peak_bytes, decode_activation_bytes),
             warmup_kv_bytes=0,
         )
+        self.engine.capture_decode_graphs(input_ids)
         self._decode_warmup_batch_sizes = decode_batch_sizes
         self._warmed = True
 
@@ -232,6 +233,7 @@ class TextGenerator:
             "model": self.engine.model_id,
             "model_revision": self.engine.model_revision,
             "warmup_batch_sizes": list(self._decode_warmup_batch_sizes),
+            "cuda_graph_batch_sizes": list(self.engine.cuda_graph_batch_sizes),
             "memory": self.engine.report.as_dict() if self.engine.report is not None else {},
             "scheduler": self.engine.scheduler_snapshot(),
             "peak_reserved_bytes": peak,

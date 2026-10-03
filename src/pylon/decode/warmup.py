@@ -1,11 +1,17 @@
+import logging
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import torch
 
 from pylon.api.types import Sampling
+from pylon.decode.graph import DecodeGraphSet
+from pylon.kv.cache import PagedKVCache
 
 if TYPE_CHECKING:
     from pylon.decode.runner import Decoder
+
+logger = logging.getLogger("pylon")
 
 
 WARMUP_PROMPT = """
@@ -112,3 +118,79 @@ def warm_decode(
                     caches.clear()
                     cache = None
     return activation_peak, batch_sizes
+
+
+def capture_each_batch_size(
+    graphs: DecodeGraphSet,
+    batch_sizes: Iterable[int],
+    capture_one: Callable[[int], None],
+) -> tuple[int, ...]:
+    for batch_size in batch_sizes:
+        if not graphs.capture_allowed(batch_size):
+            continue
+        try:
+            capture_one(batch_size)
+        except Exception:
+            logger.exception("cuda_graph_capture_failed batch_size=%s", batch_size)
+            graphs.mark_failed(batch_size)
+            _end_failed_capture()
+    return graphs.captured_sizes()
+
+
+def capture_decode_graphs(
+    decoder: "Decoder",
+    *,
+    token_id: int,
+    max_batch_size: int,
+    max_tokens: int,
+) -> tuple[int, ...]:
+    graphs = decoder.graphs
+    if not isinstance(graphs, DecodeGraphSet):
+        graphs = DecodeGraphSet()
+        decoder.graphs = graphs
+
+    def capture_one(batch_size: int) -> None:
+        caches: list[PagedKVCache] = []
+        try:
+            caches = _seed_decode_caches(
+                decoder, batch_size, token_id, max_tokens
+            )
+            graphs.capture(
+                decoder, caches, token_id=token_id, max_tokens=max_tokens
+            )
+        finally:
+            for cache in caches:
+                decoder.release_cache(cache)
+
+    return capture_each_batch_size(
+        graphs, range(1, max_batch_size + 1), capture_one
+    )
+
+
+def _seed_decode_caches(
+    decoder: "Decoder", batch_size: int, token_id: int, capacity: int
+) -> list[PagedKVCache]:
+    caches = [PagedKVCache(decoder.page_pool, capacity) for _ in range(batch_size)]
+    try:
+        for cache in caches:
+            decoder.prefill_chunk(cache, [token_id])
+        previous = decoder.graphs
+        decoder.graphs = None
+        try:
+            decoder.decode_caches(caches, [token_id] * batch_size)
+        finally:
+            decoder.graphs = previous
+    except Exception:
+        for cache in caches:
+            decoder.release_cache(cache)
+        raise
+    return caches
+
+
+def _end_failed_capture() -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        logger.exception("cuda_graph_capture_cleanup_failed")
