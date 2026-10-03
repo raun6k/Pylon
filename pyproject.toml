@@ -1,0 +1,26 @@
+[project]
+name = "pylon"
+version = "0.1.0"
+description = "Single-GPU inference server for Qwen3-4B-Instruct-2507"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "huggingface-hub",
+    "jinja2",
+    "numpy",
+    "python-dotenv",
+    "safetensors",
+    "tokenizers",
+    "torch>=2.13",
+    "uvicorn[standard]",
+]
+
+[project.scripts]
+pylon = "pylon.main:main"
+
+[build-system]
+requires = ["uv_build>=0.7.13,<0.8.0"]
+build-backend = "uv_build"

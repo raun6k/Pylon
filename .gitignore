@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[oc]
+.ruff_cache/
+.DS_Store
+build/
+dist/
+*.egg-info
+.venv
+.env
+
+# Weights and hub cache stay outside the tree
+*.safetensors
+models--*
+
+# Benchmark dumps
+benchmarks/results/*
+!benchmarks/results/.gitkeep

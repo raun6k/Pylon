@@ -1,0 +1,86 @@
+from typing import Literal
+
+from pydantic import AliasChoices, BaseModel, Field
+
+
+class Sampling(BaseModel):
+    max_new_tokens: int = Field(default=256, ge=1, le=2_048)
+    temperature: float = Field(default=0.2, ge=0, le=2)
+    top_p: float = Field(default=0.95, gt=0, le=1)
+
+
+class ChatMessage(BaseModel):
+    role: Literal["developer", "system", "user", "assistant", "tool"]
+    content: str = Field(min_length=1, max_length=20_000)
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = Field(min_length=1)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=128)
+    max_tokens: int = Field(
+        default=256,
+        validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
+        ge=1,
+        le=2_048,
+    )
+    temperature: float = Field(default=0.2, ge=0, le=2)
+    top_p: float = Field(default=0.95, gt=0, le=1)
+    stream: Literal[False] = False
+
+    def sampling(self) -> Sampling:
+        return Sampling(
+            max_new_tokens=self.max_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+        )
+
+
+class ChatCompletionMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int = 0
+    message: ChatCompletionMessage
+    finish_reason: Literal["stop", "length"]
+
+
+class ChatCompletionPromptTokensDetails(BaseModel):
+    cached_tokens: int
+
+
+class ChatCompletionUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    prompt_tokens_details: ChatCompletionPromptTokensDetails
+
+
+class ChatCompletionTimings(BaseModel):
+    tokenize_seconds: float
+    queue_seconds: float
+    prefix_lookup_seconds: float
+    restore_seconds: float
+    prefill_seconds: float
+    decode_seconds: float
+    decode_compute_seconds: float
+    decode_compute_tokens_per_second: float | None
+    inter_token_seconds: tuple[float, ...]
+    store_seconds: float
+    time_to_first_token_seconds: float
+    total_seconds: float
+    generation_tokens_per_second: float | None
+    prefill_tokens_per_second: float | None
+    decode_tokens_per_second: float | None
+    cache_hit_rate: float
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[ChatCompletionChoice]
+    usage: ChatCompletionUsage
+    timings: ChatCompletionTimings
