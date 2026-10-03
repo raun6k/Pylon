@@ -14,6 +14,7 @@ from pylon.kv.pool import KVPagePool
 from pylon.prefix.cache import (
     PrefixCache,
     PromptBlockView,
+    ResidentPrompt,
     describe_prompt_blocks,
 )
 from pylon.scheduler.admit import admit_requests
@@ -97,6 +98,8 @@ class _ActiveRequest:
     restored_tokens: int
     prompt_blocks: tuple[PromptBlockView, ...]
     prefill_wait_started: float
+    admitted_blocks: int = 0
+    pinned_blocks: int = 0
     first_token_at: float | None = None
     last_token_at: float | None = None
     token_intervals: list[float] = field(default_factory=list)
@@ -309,6 +312,7 @@ class Engine:
                 hit_tokens=0 if prefix_hit is None else prefix_hit.length,
                 restored_tokens=prefill_state.restored_tokens,
                 prefill_wait_started=job.enqueued_at,
+                admitted_blocks=prefill_state.restored_tokens // self.prefix_cache.block_size,
                 prompt_blocks=describe_prompt_blocks(
                     request.input_ids,
                     self.prefix_cache.block_size,
@@ -368,6 +372,7 @@ class Engine:
                     continue
             ready.append(active)
             rows.append(row)
+        self._publish_resident_blocks()
         if not ready:
             self.decoder._synchronize()
             elapsed = (
@@ -449,24 +454,56 @@ class Engine:
         self._active_requests = surviving
         self.prefix_cache.reserve(self._reserved_memory_bytes())
 
+    def _publish_resident_blocks(self) -> None:
+        if not self.prefix_cache_enabled:
+            return
+        block_size = self.prefix_cache.block_size
+        pending: list[tuple[_ActiveRequest, ResidentPrompt]] = []
+        for active in self._active_requests:
+            resident = min(active.prompt_offset, len(active.request.input_ids))
+            full = resident // block_size
+            if full <= active.admitted_blocks:
+                continue
+            pending.append(
+                (
+                    active,
+                    ResidentPrompt(
+                        token_ids=active.request.input_ids[: full * block_size],
+                        cache=active.cache,
+                        admitted_blocks=active.admitted_blocks,
+                    ),
+                )
+            )
+        if not pending:
+            return
+        reserved = self._reserved_memory_bytes()
+        if reserved > self.kv_budget_bytes:
+            return
+        try:
+            admissions = self.prefix_cache.admit_resident_blocks(
+                [prompt for _active, prompt in pending],
+                reserved_memory_bytes=reserved,
+            )
+        except Exception:
+            logger.exception("prefix_cache_store_failed")
+            return
+        for (active, _prompt), admission in zip(pending, admissions, strict=True):
+            active.admitted_blocks = admission.admitted_blocks
+            active.pinned_blocks += admission.pinned_blocks
+
     def _complete_request(
         self, active: _ActiveRequest, finish_reason: str, queue_seconds: float
     ) -> None:
         store_started = time.perf_counter()
         stored_blocks = 0
         try:
-            reserved = self._reserved_memory_bytes()
-            if self.prefix_cache_enabled and reserved <= self.kv_budget_bytes:
-                stored_blocks = self.prefix_cache.store_completed_blocks(
-                    active.request.input_ids,
-                    active.cache,
-                    reserved_memory_bytes=reserved,
-                )
+            self._publish_resident_blocks()
+            stored_blocks = active.pinned_blocks
         except Exception:
             logger.exception(
                 "prefix_cache_store_failed request_id=%s", active.request.request_id
             )
-            stored_blocks = 0
+            stored_blocks = active.pinned_blocks
         finally:
             self.decoder.release_cache(active.cache)
         store_seconds = time.perf_counter() - store_started
@@ -572,11 +609,10 @@ class Engine:
             stored_blocks = 0
             try:
                 if self.prefix_cache_enabled and request_bytes <= self.kv_budget_bytes:
-                    stored_blocks = self.prefix_cache.store_completed_blocks(
-                        input_ids,
-                        decoded.cache,
+                    stored_blocks = self.prefix_cache.admit_resident_blocks(
+                        [ResidentPrompt(token_ids=input_ids, cache=decoded.cache)],
                         reserved_memory_bytes=request_bytes,
-                    )
+                    )[0].pinned_blocks
             finally:
                 self.decoder.release_cache(decoded.cache)
             return GenerationResult(

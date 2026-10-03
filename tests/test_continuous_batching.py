@@ -1,5 +1,3 @@
-import hashlib
-import json
 import time
 import unittest
 from types import SimpleNamespace
@@ -40,7 +38,6 @@ class FakeDecoder:
         max_total_tokens: int,
         prefix_hit: object | None = None,
     ) -> SimpleNamespace:
-        del prefix_hit
         capacity = len(input_ids) + sampling.max_new_tokens
         if capacity > max_total_tokens:
             raise ValueError(
@@ -52,6 +49,11 @@ class FakeDecoder:
         cache = __import__(
             "pylon.kv.cache", fromlist=["PagedKVCache"]
         ).PagedKVCache(self.page_pool, capacity)
+        cached_blocks = ()
+        if prefix_hit is not None:
+            cached_blocks = tuple(prefix_hit.blocks)
+        if cached_blocks:
+            cache.restore_blocks(tuple(block.snapshot for block in cached_blocks))
         token = self._planned.pop(0) if self._planned else 5
         self._token_for_cache[id(cache)] = token
         return SimpleNamespace(
@@ -257,22 +259,46 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.finish(engine, nxt)
         self.assertEqual(nxt.result(timeout=0).output_ids, [5, 5])
 
-    def test_prefix_store_runs_at_completion_and_omits_the_short_tail(self) -> None:
+    def test_resident_block_is_sighted_before_finish_and_pinned_on_the_second_sight(self) -> None:
         engine = self.make_engine(budget_tokens=1024, prefill_chunk_size=256)
         prompt = [(index % 63) + 1 for index in range(300)]
-        future = self.enqueue(engine, "tail", prompt, 1)
+        block_hash = hash_token_blocks([tuple(prompt[:256])])[0].hash
+        future = self.enqueue(engine, "first", prompt, 1)
         self.tick(engine)
         self.assertFalse(future.done())
+        self.assertEqual(engine.prefix_cache.sighted_hashes, frozenset({block_hash}))
         self.assertEqual(engine.prefix_cache.token_count, 0)
+        self.assertEqual(engine.prefix_cache.memory_bytes, 0)
         self.finish(engine, future)
         result = future.result(timeout=0)
-        self.assertEqual(result.prefix.stored_blocks, 1)
-        self.assertEqual(engine.prefix_cache.token_count, 256)
+        self.assertEqual(result.prefix.stored_blocks, 0)
+        self.assertEqual(engine.prefix_cache.token_count, 0)
+        pool = engine.decoder.page_pool
+        self.assertEqual(pool.free_pages, pool.num_pages)
 
         short = self.enqueue(engine, "short", [(index % 63) + 1 for index in range(100)], 1)
         self.finish(engine, short)
         self.assertEqual(short.result(timeout=0).prefix.stored_blocks, 0)
+        self.assertEqual(engine.prefix_cache.sighted_hashes, frozenset({block_hash}))
+        self.assertEqual(engine.prefix_cache.token_count, 0)
+
+        second = self.enqueue(
+            engine, "second", prompt[:256] + [(index % 63) + 2 for index in range(44)], 1
+        )
+        self.tick(engine)
+        self.assertFalse(second.done())
         self.assertEqual(engine.prefix_cache.token_count, 256)
+        self.assertGreater(engine.prefix_cache.memory_bytes, 0)
+        self.finish(engine, second)
+        self.assertEqual(second.result(timeout=0).prefix.stored_blocks, 1)
+        self.assertEqual(second.result(timeout=0).prefix.hit_tokens, 0)
+        self.assertEqual(pool.free_pages, pool.num_pages - 1)
+
+        third = self.enqueue(engine, "third", prompt, 1)
+        self.finish(engine, third)
+        restored = third.result(timeout=0)
+        self.assertEqual(restored.prefix.hit_tokens, 256)
+        self.assertEqual(restored.prefix.restored_tokens, 256)
 
     def test_prefix_cache_flag_stores_nothing(self) -> None:
         engine = self.make_engine(
@@ -284,6 +310,8 @@ class ContinuousBatchingTests(unittest.TestCase):
         result = future.result(timeout=0)
         self.assertEqual(result.prefix.stored_blocks, 0)
         self.assertEqual(engine.prefix_cache.token_count, 0)
+        self.assertEqual(engine.prefix_cache.sighted_hashes, frozenset())
+        self.assertEqual(engine.prefix_cache.memory_bytes, 0)
 
     def test_aged_prefill_takes_the_next_chunk(self) -> None:
         now = 1_000.0
@@ -445,16 +473,41 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.assertFalse(skip_prefill_wave(8, 8, None))
         self.assertFalse(skip_prefill_wave(7, 8, 0.0))
 
-    def test_block_hash_is_chained_sha256_of_json(self) -> None:
-        blocks = hash_token_blocks([(1, 2), (3,)])
-        first_payload = json.dumps((1, 2), separators=(",", ":")).encode("ascii")
-        first = hashlib.sha256(first_payload).digest()
-        self.assertEqual(blocks[0].hash, first.hex())
-        self.assertEqual(blocks[0].parent_hash, "")
-        second_payload = json.dumps((3,), separators=(",", ":")).encode("ascii")
-        second = hashlib.sha256(first + second_payload).digest()
-        self.assertEqual(blocks[1].hash, second.hex())
-        self.assertEqual(blocks[1].parent_hash, first.hex())
+    def test_earlier_request_sights_a_shared_block_and_the_later_request_pins(self) -> None:
+        engine = self.make_engine(slots=2, budget_tokens=2048, prefill_chunk_size=256)
+        prompt = [(index % 63) + 1 for index in range(256)]
+        self.enqueue(engine, "earlier", prompt, 1)
+        self.enqueue(engine, "later", prompt, 1)
+        self.activate_head(engine)
+        self.activate_head(engine)
+        self.assertEqual(
+            [active.request.request_id for active in engine._active_requests],
+            ["earlier", "later"],
+        )
+        for active in engine._active_requests:
+            batch = PackedBatchCache([active.cache])
+            batch.prepare_packed([256])
+            batch.advance_packed()
+            active.prompt_offset = 256
+        earlier_page = engine._active_requests[0].cache.pages[0].index
+        later_page = engine._active_requests[1].cache.pages[0].index
+        self.assertNotEqual(earlier_page, later_page)
+        engine._publish_resident_blocks()
+        block_hash = hash_token_blocks([tuple(prompt)])[0].hash
+        cached = engine.prefix_cache.get(block_hash)
+        self.assertIsNotNone(cached)
+        self.assertEqual(tuple(page.index for page in cached.snapshot.pages), (later_page,))
+        self.assertEqual(engine.prefix_cache.token_count, 256)
+        self.assertEqual(engine._active_requests[0].pinned_blocks, 0)
+        self.assertEqual(engine._active_requests[1].pinned_blocks, 1)
+        pool = engine.decoder.page_pool
+        self.assertEqual(pool.free_pages, pool.num_pages - 2)
+        engine._active_requests[0].cache.close()
+        self.assertEqual(pool.free_pages, pool.num_pages - 1)
+        self.assertIn(earlier_page, pool._free)
+        engine._active_requests[1].cache.close()
+        self.assertEqual(pool.free_pages, pool.num_pages - 1)
+        self.assertNotIn(later_page, pool._free)
 
 
 if __name__ == "__main__":

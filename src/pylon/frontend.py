@@ -190,6 +190,7 @@ class TextGenerator:
         cache.clear()
         try:
             run(input_ids, "startup-warmup-cold")
+            run(input_ids, "startup-warmup-repeat")
             result = run(extended_ids, "startup-warmup-prefix")
             if not 0 < result.prefix.restored_tokens < len(extended_ids) - 1:
                 raise RuntimeError(

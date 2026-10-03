@@ -1,5 +1,3 @@
-import hashlib
-import json
 import math
 import time
 from collections import OrderedDict
@@ -9,20 +7,24 @@ from dataclasses import dataclass
 from pylon.kv.dense import KVBlockSnapshot, KVCache
 from pylon.kv.cache import PagedKVBlockSnapshot, PagedKVCache
 
+_FNV_OFFSET_BASIS = 14695981039346656037
+_FNV_PRIME = 1099511628211
+_U64_MASK = (1 << 64) - 1
+
 
 @dataclass(frozen=True)
 class TokenBlock:
     tokens: tuple[int, ...]
-    hash: str
-    parent_hash: str
+    hash: int
+    parent_hash: int
 
 
 @dataclass
 class CachedBlock:
     tokens: tuple[int, ...]
     snapshot: KVBlockSnapshot | PagedKVBlockSnapshot
-    hash: str = ""
-    parent_hash: str = ""
+    hash: int = 0
+    parent_hash: int = 0
     hit_count: int = 0
     expires_at: float = 0.0
 
@@ -37,11 +39,25 @@ class PrefixCacheHit:
 
 
 @dataclass(frozen=True)
+class ResidentPrompt:
+    token_ids: Sequence[int]
+    cache: KVCache | PagedKVCache
+    admitted_blocks: int = 0
+    slot: int = 0
+
+
+@dataclass(frozen=True)
+class PrefixAdmission:
+    pinned_blocks: int
+    admitted_blocks: int
+
+
+@dataclass(frozen=True)
 class PromptBlockView:
     index: int
     token_count: int
-    hash: str
-    parent_hash: str
+    hash: int
+    parent_hash: int
     status: str
 
     def as_dict(self) -> dict[str, object]:
@@ -56,8 +72,8 @@ class PromptBlockView:
 
 @dataclass(frozen=True)
 class PrefixBlockInfo:
-    hash: str
-    parent_hash: str
+    hash: int
+    parent_hash: int
     token_count: int
     hit_count: int
     memory_bytes: int
@@ -84,9 +100,21 @@ def split_token_stream(
     ]
 
 
+def _fnv1a_block(parent_hash: int, tokens: tuple[int, ...]) -> int:
+    value = _FNV_OFFSET_BASIS
+    for byte in parent_hash.to_bytes(8, "little"):
+        value ^= byte
+        value = (value * _FNV_PRIME) & _U64_MASK
+    for token in tokens:
+        for byte in token.to_bytes(4, "little"):
+            value ^= byte
+            value = (value * _FNV_PRIME) & _U64_MASK
+    return value
+
+
 def hash_token_blocks(blocks: Sequence[Sequence[int]]) -> list[TokenBlock]:
     hashed_blocks: list[TokenBlock] = []
-    parent_digest = b""
+    parent_hash = 0
 
     for block in blocks:
         tokens = tuple(block)
@@ -97,13 +125,14 @@ def hash_token_blocks(blocks: Sequence[Sequence[int]]) -> list[TokenBlock]:
             for token in tokens
         ):
             raise ValueError("Token IDs must be non-negative integers.")
+        if any(token >= 1 << 32 for token in tokens):
+            raise ValueError("Token IDs must fit in an unsigned 32-bit integer.")
 
-        payload = json.dumps(tokens, separators=(",", ":")).encode("ascii")
-        digest = hashlib.sha256(parent_digest + payload).digest()
+        digest = _fnv1a_block(parent_hash, tokens)
         hashed_blocks.append(
-            TokenBlock(tokens=tokens, hash=digest.hex(), parent_hash=parent_digest.hex())
+            TokenBlock(tokens=tokens, hash=digest, parent_hash=parent_hash)
         )
-        parent_digest = digest
+        parent_hash = digest
 
     return hashed_blocks
 
@@ -160,7 +189,8 @@ class PrefixCache:
         self.max_memory_bytes = max_memory_bytes
         self.ttl_seconds = ttl_seconds
         self._clock = clock
-        self._blocks: OrderedDict[str, CachedBlock] = OrderedDict()
+        self._blocks: OrderedDict[int, CachedBlock] = OrderedDict()
+        self._sighted: set[int] = set()
         self._memory_bytes = 0
         self._reclaimed_memory_bytes = 0
 
@@ -178,12 +208,16 @@ class PrefixCache:
         self._purge_expired(self._clock())
         return self._memory_bytes
 
+    @property
+    def sighted_hashes(self) -> frozenset[int]:
+        return frozenset(self._sighted)
+
     def clear(self) -> None:
         self._reclaimed_memory_bytes += self._memory_bytes
         self._blocks.clear()
         self._memory_bytes = 0
 
-    def get(self, block_hash: str) -> CachedBlock | None:
+    def get(self, block_hash: int) -> CachedBlock | None:
         self._purge_expired(self._clock())
         block = self._blocks.get(block_hash)
         if block is not None:
@@ -221,51 +255,77 @@ class PrefixCache:
             matched.append(cached)
         return PrefixCacheHit(tuple(matched)) if matched else None
 
-    def store_completed_blocks(
+    def admit_resident_blocks(
         self,
-        token_ids: Sequence[int],
-        cache: KVCache | PagedKVCache,
+        prompts: Sequence[ResidentPrompt],
         *,
         reserved_memory_bytes: int = 0,
-        slot: int = 0,
-    ) -> int:
+    ) -> list[PrefixAdmission]:
         now = self._clock()
         self._purge_expired(now)
-        completed_length = len(token_ids) // self.block_size * self.block_size
-        cache_length = cache.length if isinstance(cache, KVCache) else cache.slot_length(slot)
+        return [
+            self._observe_prompt(
+                prompt, reserved_memory_bytes=reserved_memory_bytes, now=now
+            )
+            for prompt in prompts
+        ]
+
+    def _observe_prompt(
+        self,
+        prompt: ResidentPrompt,
+        *,
+        reserved_memory_bytes: int,
+        now: float,
+    ) -> PrefixAdmission:
+        completed_length = len(prompt.token_ids) // self.block_size * self.block_size
+        if completed_length < 1:
+            return PrefixAdmission(0, prompt.admitted_blocks)
+        cache = prompt.cache
+        cache_length = (
+            cache.length if isinstance(cache, KVCache) else cache.slot_length(prompt.slot)
+        )
         if completed_length > cache_length:
             raise ValueError("KV cache has not processed every completed token block.")
 
-        blocks = build_token_blocks(token_ids[:completed_length], self.block_size)
+        blocks = build_token_blocks(prompt.token_ids[:completed_length], self.block_size)
         available_bytes = self.max_memory_bytes
         if available_bytes is not None:
             available_bytes -= reserved_memory_bytes
             if available_bytes < 0:
                 raise ValueError("Reserved memory must fit within the KV-cache budget.")
         snapshot_bytes = cache.memory_bytes_per_token * self.block_size
-        if available_bytes is not None and snapshot_bytes > available_bytes:
-            return 0
-
-        stored = 0
-        protected_hashes: set[str] = set()
+        can_pin = available_bytes is None or snapshot_bytes <= available_bytes
+        watermark = prompt.admitted_blocks
+        pinned = 0
+        protected_hashes: set[int] = set()
         for index, block in enumerate(blocks):
+            if index < prompt.admitted_blocks:
+                if block.hash in self._blocks:
+                    protected_hashes.add(block.hash)
+                continue
+            if block.hash not in self._sighted:
+                self._sighted.add(block.hash)
+                watermark = index + 1
+                continue
             if block.hash in self._blocks:
                 protected_hashes.add(block.hash)
+                watermark = index + 1
                 continue
-            if block.parent_hash and block.parent_hash not in self._blocks:
-                break
+            watermark = index + 1
+            if not can_pin or (index > 0 and block.parent_hash not in self._blocks):
+                continue
             if available_bytes is not None and not self._evict_to(
                 available_bytes - snapshot_bytes,
                 protected_hashes=protected_hashes,
             ):
-                break
-            if block.parent_hash and block.parent_hash not in self._blocks:
-                break
+                continue
+            if index > 0 and block.parent_hash not in self._blocks:
+                continue
             start = index * self.block_size
             snapshot = (
                 cache.snapshot_block(start, start + self.block_size)
                 if isinstance(cache, KVCache)
-                else cache.snapshot_block_slot(slot, start, start + self.block_size)
+                else cache.snapshot_block_slot(prompt.slot, start, start + self.block_size)
             )
             self._blocks[block.hash] = CachedBlock(
                 tokens=block.tokens,
@@ -276,20 +336,20 @@ class PrefixCache:
             )
             self._memory_bytes += snapshot_bytes
             protected_hashes.add(block.hash)
-            stored += 1
-        return stored
+            pinned += 1
+        return PrefixAdmission(pinned_blocks=pinned, admitted_blocks=watermark)
 
     def blocks(self) -> list[PrefixBlockInfo]:
         self._purge_expired(self._clock())
         return [
             PrefixBlockInfo(
-                hash=block.hash or key,
+                hash=block.hash,
                 parent_hash=block.parent_hash,
                 token_count=len(block.tokens),
                 hit_count=block.hit_count,
                 memory_bytes=self._snapshot_bytes(block.snapshot),
             )
-            for key, block in self._blocks.items()
+            for block in self._blocks.values()
         ]
 
     def _purge_expired(self, now: float) -> None:
@@ -305,14 +365,14 @@ class PrefixCache:
         self,
         target_bytes: int,
         *,
-        protected_hashes: set[str] | None = None,
+        protected_hashes: set[int] | None = None,
     ) -> bool:
         protected_hashes = protected_hashes or set()
         while self._memory_bytes > target_bytes:
             parent_hashes = {
                 block.parent_hash
                 for block in self._blocks.values()
-                if block.parent_hash
+                if block.parent_hash in self._blocks
             }
             for block_hash in self._blocks:
                 if block_hash not in protected_hashes and block_hash not in parent_hashes:
@@ -322,7 +382,7 @@ class PrefixCache:
             self._remove(block_hash)
         return True
 
-    def _remove(self, block_hash: str) -> None:
+    def _remove(self, block_hash: int) -> None:
         block = self._blocks.pop(block_hash)
         memory_bytes = self._snapshot_bytes(block.snapshot)
         self._memory_bytes -= memory_bytes
