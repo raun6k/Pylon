@@ -4,13 +4,22 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](#requirements)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.13%2B-ee4c2c)](#requirements)
 
-[What it does](#what-it-does) · [Decode benchmark](#decode-benchmark) · [Run](#run) · [Reproduce](#reproduce)
-
 Pylon is a single-GPU inference server for [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507). The weights stay fixed. It exposes an OpenAI-compatible `POST /v1/chat/completions` endpoint.
 
 The additions on top of a normal serving loop are decode-first scheduling, CUDA-graph decode, a two-hit prefix cache, prompt n-gram verification, and skip-ahead admission.
 
 On one NVIDIA L4, CUDA-graph decode beat this server's own eager path. Output speed went from 24.8 to 26.2 tokens/s at concurrency 1, and from 176.0 to 184.9 at concurrency 8. Speculation, the prefix cache, and admit-skip were off. Temperature was 0. This is not a comparison against another server.
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Decode benchmark](#decode-benchmark)
+- [Requirements](#requirements)
+- [Run](#run)
+- [Unit tests](#unit-tests)
+- [Smoke check](#smoke-check)
+- [Reproduce](#reproduce)
+- [License](#license)
 
 ## What it does
 
