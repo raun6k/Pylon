@@ -1,3 +1,4 @@
+import os
 import time
 import unittest
 from types import SimpleNamespace
@@ -5,14 +6,16 @@ from unittest.mock import patch
 
 import torch
 
+from benchmarks.run import result_flags, system_environ
 from pylon.api.types import Sampling
-from pylon.config import PylonConfig
+from pylon.config import PylonConfig, get_config
 from pylon.engine import FULL_BATCH_PREFILL_WAIT_SECONDS, Engine, skip_prefill_wave
 from pylon.kv.budget import CacheCapacity, MemoryReport
 from pylon.kv.cache import PackedBatchCache, PagedBatchCache
 from pylon.kv.pool import KVPagePool
 from pylon.model.config import Qwen3Config
 from pylon.prefix.cache import hash_token_blocks
+from pylon.scheduler.admit import ADMIT_SKIP_WAIT_SECONDS
 from pylon.scheduler.batch import PREFILL_MAX_WAIT_SECONDS, pack_tick
 
 
@@ -122,6 +125,7 @@ class ContinuousBatchingTests(unittest.TestCase):
         budget_tokens: int = 8192,
         prefill_chunk_size: int = 256,
         prefix_cache: bool = True,
+        admit_skip: int = 4,
     ) -> Engine:
         element_size = torch.empty((), dtype=self.config.dtype).element_size()
         bytes_per_token = (
@@ -160,6 +164,7 @@ class ContinuousBatchingTests(unittest.TestCase):
                     prefill_chunk_size=prefill_chunk_size,
                     batch_wait_ms=0,
                     prefix_cache=prefix_cache,
+                    admit_skip=admit_skip,
                 ),
                 decoder=self.decoder,
                 capacity=capacity,
@@ -178,6 +183,20 @@ class ContinuousBatchingTests(unittest.TestCase):
 
     def tick(self, engine: Engine) -> None:
         engine._continuous_tick(engine._scheduler)
+
+    def tick_at(self, engine: Engine, now: float) -> None:
+        with patch("pylon.scheduler.admit.time.perf_counter", return_value=now):
+            self.tick(engine)
+
+    def set_wait(self, engine: Engine, name: str, seconds: float, now: float) -> None:
+        for job in engine._scheduler.waiting_jobs():
+            if job.payload.request_id == name:
+                job.enqueued_at = now - seconds
+                return
+        self.fail(f"{name} is not waiting")
+
+    def ids(self, engine: Engine, key: str) -> list[str]:
+        return list(engine.scheduler_snapshot()[key])
 
     def finish(self, engine: Engine, *futures) -> None:
         for _ in range(64):
@@ -508,6 +527,245 @@ class ContinuousBatchingTests(unittest.TestCase):
         engine._active_requests[1].cache.close()
         self.assertEqual(pool.free_pages, pool.num_pages - 1)
         self.assertNotIn(later_page, pool._free)
+
+    def engine_with_one_decode(self, pages: int, *, admit_skip: int = 4) -> Engine:
+        engine = self.make_engine(
+            slots=8, budget_tokens=256 * pages, admit_skip=admit_skip
+        )
+        self.enqueue(engine, "decode", [1, 2, 3, 4], 32)
+        self.tick(engine)
+        active = engine._active_requests
+        self.assertEqual([item.request.request_id for item in active], ["decode"])
+        self.assertIsNotNone(active[0].pending_token_id)
+        self.assertEqual(engine.head_skips, 0)
+        return engine
+
+    def test_short_job_starts_while_the_longer_head_keeps_its_place(self) -> None:
+        engine = self.engine_with_one_decode(4)
+        long = self.enqueue(engine, "long", [2] * (3 * 256 - 1), 1)
+        short = self.enqueue(engine, "short", [3] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "waiting"), ["long"])
+        self.assertEqual(self.ids(engine, "active"), ["decode", "short"])
+        self.assertEqual(engine.head_skips, 1)
+        self.assertFalse(long.done())
+        admitted = engine._active_requests[1]
+        self.assertEqual(
+            admitted.reservation_bytes, engine.request_cache_bytes(64 + 8)
+        )
+
+    def test_admit_skip_zero_leaves_the_short_job_behind_the_head(self) -> None:
+        engine = self.engine_with_one_decode(4, admit_skip=0)
+        self.enqueue(engine, "long", [2] * (3 * 256 - 1), 1)
+        short = self.enqueue(engine, "short", [3] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "waiting"), ["long", "short"])
+        self.assertEqual(self.ids(engine, "active"), ["decode"])
+        self.assertEqual(engine.head_skips, 0)
+        self.assertFalse(short.done())
+
+    def test_four_non_fitting_jobs_can_be_passed_to_reach_a_later_fit(self) -> None:
+        engine = self.engine_with_one_decode(4)
+        for index in range(5):
+            self.enqueue(engine, f"block-{index}", [2] * (3 * 256 - 1), 1)
+        self.enqueue(engine, "short", [3] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(
+            self.ids(engine, "waiting"), [f"block-{index}" for index in range(5)]
+        )
+        self.assertEqual(self.ids(engine, "active"), ["decode", "short"])
+        self.assertEqual(engine.head_skips, 1)
+
+    def test_a_fifth_non_fitting_job_stops_the_scan(self) -> None:
+        engine = self.engine_with_one_decode(4)
+        for index in range(6):
+            self.enqueue(engine, f"block-{index}", [2] * (3 * 256 - 1), 1)
+        short = self.enqueue(engine, "short", [3] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(
+            self.ids(engine, "waiting"),
+            [f"block-{index}" for index in range(6)] + ["short"],
+        )
+        self.assertEqual(self.ids(engine, "active"), ["decode"])
+        self.assertEqual(engine.head_skips, 0)
+        self.assertFalse(short.done())
+
+    def test_each_admission_behind_the_head_counts_once(self) -> None:
+        engine = self.engine_with_one_decode(4)
+        self.enqueue(engine, "long", [2] * (3 * 256 - 1), 1)
+        self.enqueue(engine, "short-a", [3] * 64, 8)
+        self.enqueue(engine, "short-b", [4] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "waiting"), ["long"])
+        self.assertEqual(self.ids(engine, "active"), ["decode", "short-a", "short-b"])
+        self.assertEqual(engine.head_skips, 2)
+
+    def test_skipped_jobs_keep_their_order(self) -> None:
+        engine = self.engine_with_one_decode(4)
+        self.enqueue(engine, "first-block", [2] * (3 * 256 - 1), 1)
+        self.enqueue(engine, "second-block", [4] * (3 * 256 - 1), 1)
+        self.enqueue(engine, "short", [3] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "waiting"), ["first-block", "second-block"])
+        self.assertEqual(engine.head_skips, 1)
+
+    def test_a_job_that_has_waited_100ms_is_not_skipped(self) -> None:
+        self.assertEqual(ADMIT_SKIP_WAIT_SECONDS, 0.1)
+        now = 1_000.0
+        engine = self.engine_with_one_decode(4)
+        long = self.enqueue(engine, "long", [2] * (3 * 256 - 1), 1)
+        short = self.enqueue(engine, "short", [3] * 64, 8)
+        self.set_wait(engine, "long", ADMIT_SKIP_WAIT_SECONDS, now)
+        self.tick_at(engine, now)
+        self.assertEqual(self.ids(engine, "waiting"), ["long", "short"])
+        self.assertEqual(self.ids(engine, "active"), ["decode"])
+        self.assertEqual(engine.head_skips, 0)
+        self.assertFalse(long.done())
+        self.assertFalse(short.done())
+
+    def test_a_job_younger_than_100ms_can_be_skipped(self) -> None:
+        now = 1_000.0
+        engine = self.engine_with_one_decode(4)
+        self.enqueue(engine, "long", [2] * (3 * 256 - 1), 1)
+        self.enqueue(engine, "short", [3] * 64, 8)
+        self.set_wait(engine, "long", ADMIT_SKIP_WAIT_SECONDS - 0.001, now)
+        self.tick_at(engine, now)
+        self.assertEqual(self.ids(engine, "waiting"), ["long"])
+        self.assertEqual(self.ids(engine, "active"), ["decode", "short"])
+        self.assertEqual(engine.head_skips, 1)
+
+    def test_an_aged_job_behind_the_head_stops_the_scan(self) -> None:
+        now = 1_000.0
+        engine = self.engine_with_one_decode(4)
+        self.enqueue(engine, "young", [2] * (3 * 256 - 1), 1)
+        self.enqueue(engine, "aged", [4] * (3 * 256 - 1), 1)
+        short = self.enqueue(engine, "short", [3] * 64, 8)
+        self.set_wait(engine, "aged", ADMIT_SKIP_WAIT_SECONDS, now)
+        self.tick_at(engine, now)
+        self.assertEqual(self.ids(engine, "waiting"), ["young", "aged", "short"])
+        self.assertEqual(self.ids(engine, "active"), ["decode"])
+        self.assertEqual(engine.head_skips, 0)
+        self.assertFalse(short.done())
+
+    def test_admitting_the_head_does_not_count_as_a_skip(self) -> None:
+        engine = self.make_engine(budget_tokens=256 * 2)
+        self.enqueue(engine, "only", [1, 2, 3, 4], 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "active"), ["only"])
+        self.assertEqual(engine.head_skips, 0)
+
+    def test_reservation_stays_the_rounded_prompt_plus_max_new_tokens(self) -> None:
+        engine = self.make_engine(budget_tokens=256 * 4, prefill_chunk_size=8)
+        self.enqueue(engine, "job", [4] * 64, 200)
+        self.tick(engine)
+        active = engine._active_requests[0]
+        self.assertEqual(active.prompt_offset, 8)
+        self.assertEqual(active.reservation_bytes, engine.request_cache_bytes(64 + 200))
+        self.assertEqual(
+            active.reservation_bytes,
+            2 * engine.prefix_cache.block_size * engine.capacity.bytes_per_token,
+        )
+
+    def test_free_page_floor_blocks_a_reservation_that_fills_the_budget(self) -> None:
+        engine = self.engine_with_one_decode(2)
+        page_bytes = engine.prefix_cache.block_size * engine.capacity.bytes_per_token
+        reserved = engine._reserved_memory_bytes(extra_capacity=64 + 8)
+        self.assertLessEqual(reserved, engine.kv_budget_bytes)
+        self.assertEqual((engine.kv_budget_bytes - reserved) // page_bytes, 0)
+        job = self.enqueue(engine, "fills", [3] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "waiting"), ["fills"])
+        self.assertEqual(self.ids(engine, "active"), ["decode"])
+        self.assertEqual(engine.head_skips, 0)
+        self.assertFalse(job.done())
+
+    def test_a_prefill_does_not_consume_the_free_page_floor(self) -> None:
+        engine = self.make_engine(budget_tokens=256 * 2, prefill_chunk_size=4)
+        self.enqueue(engine, "prefill", [1] * 200, 1)
+        self.tick(engine)
+        active = engine._active_requests[0]
+        self.assertIsNone(active.pending_token_id)
+        self.assertEqual(active.prompt_offset, 4)
+        self.enqueue(engine, "next", [3] * 40, 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "active"), ["prefill", "next"])
+        self.assertEqual(self.ids(engine, "waiting"), [])
+        self.assertEqual(engine.head_skips, 0)
+
+    def test_skip_applies_when_the_head_would_break_the_free_page_floor(self) -> None:
+        engine = self.make_engine(slots=8, budget_tokens=256 * 5)
+        self.enqueue(engine, "decode-a", [1, 2, 3, 4], 32)
+        self.enqueue(engine, "decode-b", [5, 6, 7, 8], 32)
+        self.tick(engine)
+        self.tick(engine)
+        decoding = [
+            item.request.request_id
+            for item in engine._active_requests
+            if item.pending_token_id is not None
+        ]
+        self.assertEqual(decoding, ["decode-a", "decode-b"])
+        page_bytes = engine.prefix_cache.block_size * engine.capacity.bytes_per_token
+        wide_capacity = (2 * 256 - 1) + 1
+        reserved = engine._reserved_memory_bytes(extra_capacity=wide_capacity)
+        self.assertLessEqual(reserved, engine.kv_budget_bytes)
+        self.assertEqual((engine.kv_budget_bytes - reserved) // page_bytes, 1)
+        wide = self.enqueue(engine, "wide", [2] * (2 * 256 - 1), 1)
+        self.enqueue(engine, "short", [3] * 64, 8)
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "waiting"), ["wide"])
+        self.assertIn("short", self.ids(engine, "active"))
+        self.assertEqual(engine.head_skips, 1)
+        self.assertFalse(wide.done())
+
+    def test_a_cancelled_job_in_the_window_does_not_block_a_later_fit(self) -> None:
+        engine = self.engine_with_one_decode(4)
+        self.enqueue(engine, "long", [2] * (3 * 256 - 1), 1)
+        cancelled = self.enqueue(engine, "cancelled", [4] * (3 * 256 - 1), 1)
+        self.enqueue(engine, "short", [3] * 64, 8)
+        self.assertTrue(cancelled.cancel())
+        self.tick(engine)
+        self.assertEqual(self.ids(engine, "waiting"), ["long"])
+        self.assertEqual(self.ids(engine, "active"), ["decode", "short"])
+        self.assertEqual(engine.head_skips, 1)
+        self.assertTrue(cancelled.cancelled())
+
+
+class AdmitSkipConfigTests(unittest.TestCase):
+    def test_admit_skip_defaults_to_four_and_rejects_a_negative_value(self) -> None:
+        self.assertEqual(PylonConfig().admit_skip, 4)
+        with (
+            patch("pylon.config.load_dotenv"),
+            patch.dict(os.environ, {"PYLON_ADMIT_SKIP": "0"}),
+        ):
+            self.assertEqual(get_config().admit_skip, 0)
+        with (
+            patch("pylon.config.load_dotenv"),
+            patch.dict(os.environ, {"PYLON_ADMIT_SKIP": "4"}),
+        ):
+            self.assertEqual(get_config().admit_skip, 4)
+        for raw in ("-1", "true"):
+            with (
+                patch("pylon.config.load_dotenv"),
+                patch.dict(os.environ, {"PYLON_ADMIT_SKIP": raw}),
+            ):
+                with self.assertRaises(ValueError):
+                    get_config()
+        with self.assertRaises(ValueError):
+            PylonConfig(admit_skip=-1)
+        with self.assertRaises(ValueError):
+            PylonConfig(admit_skip=True)
+
+    def test_eager_column_forces_skip_off_and_pylon_uses_four(self) -> None:
+        base = {"PYLON_ADMIT_SKIP": "9", "PYLON_PREFIX_CACHE": "true"}
+        eager = system_environ(base, "eager")
+        pylon = system_environ(base, "pylon")
+        self.assertEqual(eager["PYLON_ADMIT_SKIP"], "0")
+        self.assertEqual(pylon["PYLON_ADMIT_SKIP"], "4")
+        self.assertEqual(result_flags("eager", eager)["admit_skip"], 0)
+        self.assertEqual(result_flags("eager", {"PYLON_ADMIT_SKIP": "4"})["admit_skip"], 0)
+        self.assertEqual(result_flags("pylon")["admit_skip"], 4)
+        self.assertEqual(result_flags("pylon", pylon)["admit_skip"], 4)
+        self.assertEqual(result_flags("vllm")["admit_skip"], 0)
 
 
 if __name__ == "__main__":

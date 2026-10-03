@@ -357,9 +357,11 @@ def system_environ(base: dict[str, str], system: str) -> dict[str, str]:
         env["PYLON_CUDA_GRAPHS"] = "false"
         env["PYLON_PREFIX_CACHE"] = "false"
         env["PYLON_SPECULATE_K"] = "1"
+        env["PYLON_ADMIT_SKIP"] = "0"
     elif system == "pylon":
         env["PYLON_CUDA_GRAPHS"] = "true"
         env["PYLON_PREFIX_CACHE"] = "false"
+        env["PYLON_ADMIT_SKIP"] = "4"
     return env
 
 
@@ -369,11 +371,17 @@ def result_flags(
     speculate_k = 1
     if env is not None and "PYLON_SPECULATE_K" in env:
         speculate_k = int(env["PYLON_SPECULATE_K"])
+    if system == "pylon":
+        admit_skip = 4
+        if env is not None and "PYLON_ADMIT_SKIP" in env:
+            admit_skip = int(env["PYLON_ADMIT_SKIP"])
+    else:
+        admit_skip = 0
     return {
         "cuda_graphs": system == "pylon",
         "speculation": speculate_k > 1,
         "prefix_cache": system not in {"eager", "pylon"},
-        "admit_skip": 0,
+        "admit_skip": admit_skip,
     }
 
 

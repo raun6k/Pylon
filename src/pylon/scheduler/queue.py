@@ -62,6 +62,26 @@ class Scheduler(Generic[Payload, Result]):
             self._remove_cancelled_jobs()
             return self._waiting[0] if self._waiting else None
 
+    def waiting_jobs(self) -> tuple[Job[Payload, Result], ...]:
+        with self._condition:
+            self._remove_cancelled_jobs()
+            return tuple(self._waiting)
+
+    def take_job(
+        self, expected: Job[Payload, Result]
+    ) -> Job[Payload, Result] | None:
+        with self._condition:
+            self._remove_cancelled_jobs()
+            for index, job in enumerate(self._waiting):
+                if job is not expected:
+                    continue
+                del self._waiting[index]
+                if not job.future.set_running_or_notify_cancel():
+                    return None
+                self._active = (*self._active, job)
+                return job
+            return None
+
     def take(
         self, expected: Job[Payload, Result] | None = None
     ) -> Job[Payload, Result] | None:

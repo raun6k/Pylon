@@ -2,7 +2,7 @@
 
 Pylon is a single-GPU inference server for [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507). It exposes an OpenAI-compatible `POST /v1/chat/completions` endpoint. The weights stay fixed.
 
-Each step decodes every active request, then prefills one 256-token chunk of a waiting prompt. If the decode batch is already full and the oldest unfinished prompt has been waiting less than 100 ms, prefill waits. Time to first token can increase in that case. KV is stored in 256-token pages. A full page of prompt tokens is recorded as soon as it is resident, and that page is kept once the same block has been seen again. Set `PYLON_PREFIX_CACHE=false` to disable the prefix cache.
+Each step decodes every active request, then prefills one 256-token chunk of a waiting prompt. If the decode batch is already full and the oldest unfinished prompt has been waiting less than 100 ms, prefill waits. Time to first token can increase in that case. KV is stored in 256-token pages. A full page of prompt tokens is recorded as soon as it is resident, and that page is kept once the same block has been seen again. Set `PYLON_PREFIX_CACHE=false` to disable the prefix cache. Each admitted request reserves its whole prompt and its full generation, rounded up to pages, and one free page is kept for every request already decoding. If the first waiting request does not fit, a later request that does can start. `PYLON_ADMIT_SKIP` is how many waiting requests may be passed over and defaults to 4. A request that has waited 100 ms stays next.
 
 ## Requirements
 

@@ -125,6 +125,7 @@ class Engine:
         self._speculate_k = config.speculate_k
         self._prefill_chunk_size = config.prefill_chunk_size
         self._max_batch_size = config.max_batch_size
+        self.head_skips = 0
         self._memory_checker = None
         if decoder is None:
             from pylon.model.loader import ModelLoader
