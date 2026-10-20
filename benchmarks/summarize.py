@@ -1,9 +1,13 @@
 """Turn benchmark result files into the markdown tables and plots the README shows.
 
-    python benchmarks/summarize.py pylon=<file> vllm=<file> before=<file> eager=<file>
+    python benchmarks/summarize.py before=<file> eager=<file> pylon=<file> vllm=<file>
 
 Each argument names one column and points at a result JSON written by benchmarks/run.py.
 A column can come from several files: repeat the name and the rows are merged.
+
+The columns are one server at three stages plus the reference: the previous release
+(`before`), today's scheduling and memory work with CUDA graphs and the prefix cache off
+(`eager` in the harness), the full server (`pylon`), and vLLM.
 """
 
 import json
@@ -15,16 +19,16 @@ TABLES = ROOT / "benchmarks" / "tables"
 PLOTS = ROOT / "benchmarks" / "plots"
 WORKLOADS = ("decode_heavy", "prefill_heavy", "shared_prefix")
 CONCURRENCY = (1, 8, 16)
-COLUMN_ORDER = ("eager", "before", "pylon", "vllm")
+COLUMN_ORDER = ("before", "eager", "pylon", "vllm")
 COLUMN_LABEL = {
-    "eager": "eager",
+    "eager": "pylon, graphs and cache off",
     "before": "pylon (before)",
     "pylon": "pylon",
     "vllm": "vLLM 0.30.0",
 }
 COLUMN_STYLE = {
-    "eager": ("#888888", "s", ":"),
-    "before": ("#d95f02", "v", "--"),
+    "eager": ("#66a61e", "s", ":"),
+    "before": ("#bbbbbb", "v", "--"),
     "pylon": ("#1b9e77", "o", "-"),
     "vllm": ("#7570b3", "^", "-"),
 }
@@ -124,6 +128,35 @@ def ratio_table(rows: dict, numerator: str, denominator: str, title: str) -> str
     return "\n".join(out)
 
 
+def percent_of_vllm_table(rows: dict, columns: list[str]) -> str:
+    stages = [name for name in columns if name != "vllm"]
+    out = [
+        "### Each stage as a percentage of vLLM 0.30.0\n",
+        "Output tokens per second (higher is better) / time to first token p50 (lower is better).\n",
+        "| Workload | Concurrency | " + " | ".join(COLUMN_LABEL[n] for n in stages) + " |",
+        "| --- | ---: | " + " | ".join("---:" for _ in stages) + " |",
+    ]
+    for workload in WORKLOADS:
+        for concurrency in CONCURRENCY:
+            reference = rows.get(("vllm", workload, concurrency))
+            if reference is None:
+                continue
+            ref = reference["summary"]
+            cells = []
+            for name in stages:
+                run = rows.get((name, workload, concurrency))
+                if run is None:
+                    cells.append("–")
+                    continue
+                own = run["summary"]
+                rate = 100 * own["output_tokens_per_second"] / ref["output_tokens_per_second"]
+                ttft = 100 * own["ttft_seconds"]["p50"] / ref["ttft_seconds"]["p50"]
+                cells.append(f"{rate:.0f}% / {ttft:,.0f}%")
+            out.append(f"| {workload} | {concurrency} | " + " | ".join(cells) + " |")
+    out.append("")
+    return "\n".join(out)
+
+
 def setup_lines(meta: dict, columns: list[str]) -> str:
     any_meta = next(iter(meta.values()))
     lines = [
@@ -176,8 +209,9 @@ def plots(rows: dict, columns: list[str]) -> list[Path]:
     """The two figures from the benchmark spec, from decode_heavy.
 
     Concurrency 1 to 16 spans a 15x range, so each concurrency gets its own panel and its
-    own axis. Bars start at zero, carry their value, and show each system's value as a
-    percentage of vLLM's.
+    own axis. Bars start at zero and carry their value and their percentage of vLLM. A bar
+    more than three times the tallest other bar is cut at the top and labeled, so it does
+    not flatten the rest.
     """
     import matplotlib
 
@@ -198,40 +232,51 @@ def plots(rows: dict, columns: list[str]) -> list[Path]:
             "{:.1f}",
         ),
     )
-    systems = [name for name in columns if name != "before"]
     PLOTS.mkdir(parents=True, exist_ok=True)
     written = []
     for filename, ylabel, value, number in specs:
-        figure, axes = plt.subplots(1, len(CONCURRENCY), figsize=(9.0, 3.8), dpi=140)
+        figure, axes = plt.subplots(1, len(CONCURRENCY), figsize=(10.0, 4.2), dpi=140)
         for axis, concurrency in zip(axes, CONCURRENCY):
             values = {
                 name: value(rows[(name, "decode_heavy", concurrency)]["summary"])
-                for name in systems
+                for name in columns
                 if (name, "decode_heavy", concurrency) in rows
             }
             reference = values.get("vllm")
-            top = max(values.values())
-            for position, name in enumerate(systems):
-                if name not in values:
-                    continue
+            limit = None
+            for name, own in values.items():
+                others = [v for n, v in values.items() if n != name]
+                if others and own > 3 * max(others):
+                    limit = max(others) * 1.35
+            top = limit or max(values.values()) * 1.25
+            for position, name in enumerate(columns):
                 color = COLUMN_STYLE[name][0]
-                axis.bar(position, values[name], color=color, width=0.7, label=COLUMN_LABEL[name])
-                label = number.format(values[name])
+                if name not in values:
+                    axis.text(position, top * 0.03, "not\nrun", ha="center", va="bottom", fontsize=7, color="#777777")
+                    continue
+                own = values[name]
+                clipped = own > top
+                height = top * 0.92 if clipped else own
+                axis.bar(position, height, color=color, width=0.72, hatch="//" if clipped else None,
+                         edgecolor="white" if clipped else None)
+                label = number.format(own)
                 if reference and name != "vllm":
-                    label += f"\n({100 * values[name] / reference:.0f}%)"
-                axis.text(
-                    position, values[name] + top * 0.015, label, ha="center", va="bottom", fontsize=8
-                )
+                    label += f"\n({100 * own / reference:,.0f}%)"
+                if clipped:
+                    label += "\noff scale"
+                axis.text(position, height + top * 0.012, label, ha="center", va="bottom", fontsize=7)
             axis.set_title(f"Concurrency {concurrency}", fontsize=10)
             axis.set_xticks([])
-            axis.set_ylim(0, top * 1.22)
+            axis.set_xlim(-0.6, len(columns) - 0.4)
+            axis.set_ylim(0, top * 1.12)
             axis.grid(axis="y", alpha=0.25)
             axis.set_axisbelow(True)
             for edge in ("top", "right"):
                 axis.spines[edge].set_visible(False)
         axes[0].set_ylabel(ylabel)
-        handles, labels = axes[0].get_legend_handles_labels()
-        figure.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False)
+        handles = [plt.Rectangle((0, 0), 1, 1, color=COLUMN_STYLE[name][0]) for name in columns]
+        figure.legend(handles, [COLUMN_LABEL[name] for name in columns], loc="lower center",
+                      ncol=len(columns), frameon=False, fontsize=9)
         figure.suptitle("decode_heavy  (percentages are relative to vLLM)", fontsize=10)
         figure.tight_layout(rect=(0, 0.07, 1, 0.95))
         path = PLOTS / filename
@@ -253,7 +298,7 @@ def main() -> None:
             setup_lines(meta, columns),
             "\nTTFT is server time from the request joining the queue to its first token. "
             "32 requests, 3 repeats, temperature 0. pylon and vLLM run with the prefix cache on for "
-            "shared_prefix only; eager never has it.\n",
+            "shared_prefix only; the graphs-and-cache-off stage never has it.\n",
             workload_tables(rows, columns),
         ]
         + (
@@ -261,11 +306,7 @@ def main() -> None:
             if "before" in columns
             else []
         )
-        + (
-            [ratio_table(rows, "pylon", "vllm", "pylon vs vLLM 0.30.0")]
-            if "vllm" in columns
-            else []
-        )
+        + ([percent_of_vllm_table(rows, columns)] if "vllm" in columns else [])
     )
     path = TABLES / "summary.md"
     path.write_text(text)
