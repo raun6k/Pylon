@@ -173,43 +173,66 @@ def headline_tables(rows: dict, columns: list[str]) -> str:
 
 
 def plots(rows: dict, columns: list[str]) -> list[Path]:
-    """The two figures from the benchmark spec: decode_heavy, one line per system."""
+    """The two figures from the benchmark spec: decode_heavy, one line per system.
+
+    Concurrency 1 to 16 spans a 15x range, so the lines overlap on a single axis. Each figure
+    therefore has the absolute values on top and, below, each system as a percentage of vLLM on
+    an axis zoomed to the data.
+    """
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     specs = (
-        ("ttft_vs_concurrency.png", "Time to first token p50 (seconds)", lambda s: s["ttft_seconds"]["p50"]),
+        (
+            "ttft_vs_concurrency.png",
+            "Time to first token p50 (seconds)",
+            "TTFT, % of vLLM (lower is better)",
+            lambda s: s["ttft_seconds"]["p50"],
+        ),
         (
             "output_tokens_per_second_vs_concurrency.png",
             "Output tokens per second",
+            "Output rate, % of vLLM (higher is better)",
             lambda s: s["output_tokens_per_second"],
         ),
     )
     PLOTS.mkdir(parents=True, exist_ok=True)
     written = []
-    for filename, ylabel, value in specs:
-        figure, axis = plt.subplots(figsize=(5.2, 3.6), dpi=140)
+    for filename, ylabel, relative_label, value in specs:
+        series: dict[str, list[tuple[int, float]]] = {}
         for name in columns:
             if name == "before":
                 continue
-            points = [
+            series[name] = [
                 (concurrency, value(rows[(name, "decode_heavy", concurrency)]["summary"]))
                 for concurrency in CONCURRENCY
                 if (name, "decode_heavy", concurrency) in rows
             ]
+        baseline = dict(series.get("vllm", []))
+        figure, (top, bottom) = plt.subplots(
+            2, 1, figsize=(5.2, 5.6), dpi=140, sharex=True, gridspec_kw={"height_ratios": [3, 2]}
+        )
+        for name, points in series.items():
             if not points:
                 continue
             color, marker, style = COLUMN_STYLE[name]
-            axis.plot(*zip(*points), color=color, marker=marker, linestyle=style, label=COLUMN_LABEL[name])
-        axis.set_title("decode_heavy")
-        axis.set_xlabel("Concurrency")
-        axis.set_ylabel(ylabel)
-        axis.set_xticks(CONCURRENCY)
-        axis.set_ylim(bottom=0)
-        axis.grid(alpha=0.25)
-        axis.legend(frameon=False)
+            top.plot(*zip(*points), color=color, marker=marker, linestyle=style, label=COLUMN_LABEL[name])
+            if baseline and name != "vllm":
+                relative = [(c, 100 * v / baseline[c]) for c, v in points if c in baseline]
+                bottom.plot(*zip(*relative), color=color, marker=marker, linestyle=style, label=COLUMN_LABEL[name])
+        if baseline:
+            bottom.axhline(100, color=COLUMN_STYLE["vllm"][0], linestyle="-", label=COLUMN_LABEL["vllm"])
+        top.set_title("decode_heavy")
+        top.set_ylabel(ylabel)
+        top.set_ylim(bottom=0)
+        top.legend(frameon=False)
+        bottom.set_ylabel(relative_label, fontsize=8)
+        bottom.set_xlabel("Concurrency")
+        bottom.set_xticks(CONCURRENCY)
+        for axis in (top, bottom):
+            axis.grid(alpha=0.25)
         figure.tight_layout()
         path = PLOTS / filename
         figure.savefig(path)
