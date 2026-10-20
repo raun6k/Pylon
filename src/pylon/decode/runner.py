@@ -259,8 +259,12 @@ class Decoder:
             return self._decode_dense(tokens, caches)[:, -1, :]
 
     def packed_caches(
-        self, caches: list[PagedKVCache], chunks: list[list[int]]
-    ) -> torch.Tensor:
+        self,
+        caches: list[PagedKVCache],
+        chunks: list[list[int]],
+        *,
+        logit_rows: list[int] | None = None,
+    ) -> torch.Tensor | None:
         if (
             not caches
             or len(caches) != len(chunks)
@@ -282,7 +286,7 @@ class Decoder:
                     [token for chunk in chunks for token in chunk],
                     torch.long,
                 ).unsqueeze(0)
-                batch.prepare_packed([len(chunk) for chunk in chunks])
+                batch.prepare_packed([len(chunk) for chunk in chunks], logit_rows)
                 return self.model(tokens, cache=batch)
             finally:
                 batch.caches = ()

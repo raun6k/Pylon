@@ -241,5 +241,6 @@ class TextGenerator:
             "cuda_graph_batch_sizes": list(self.engine.cuda_graph_batch_sizes),
             "memory": self.engine.report.as_dict() if self.engine.report is not None else {},
             "scheduler": self.engine.scheduler_snapshot(),
+            "config": self.engine.serving_config(),
             "peak_reserved_bytes": peak,
         }

@@ -309,7 +309,7 @@ class NgramWaveTests(unittest.TestCase):
         engine = self.make_engine()
         future = self.enqueue(engine, "hit", PROMPT, 8)
         self.tick(engine)
-        self.assertEqual([name for name, _chunks in self.decoder.forwards], ["prefill"])
+        self.assertEqual([name for name, _chunks in self.decoder.forwards], ["packed"])
         self.decoder.forwards.clear()
         self.decoder.graphs.sizes.clear()
         self.tick(engine)

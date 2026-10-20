@@ -6,7 +6,12 @@ from torch.nn.attention.bias import causal_lower_right
 
 from pylon.kv.dense import BatchedKVCache, DecodeKVCache, KVCache
 from pylon.model.config import Qwen3Config
-from pylon.model.layers import RMSNorm, TransformerBlock, rope_parameters
+from pylon.model.layers import (
+    RMSNorm,
+    TransformerBlock,
+    rope_for_positions,
+    rope_parameters,
+)
 from pylon.kv.cache import PackedBatchCache, PagedBatchCache
 
 
@@ -29,6 +34,22 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
+    def _rope(
+        self,
+        tokens: int,
+        *,
+        start_pos: int = 0,
+        position_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return rope_for_positions(
+            self.cos,
+            self.sin,
+            tokens,
+            self.config.dtype,
+            start_pos=start_pos,
+            position_ids=position_ids,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -36,7 +57,7 @@ class Qwen3Model(nn.Module):
         position_ids: torch.Tensor | None = None,
         cache_slots: Sequence[int] | torch.Tensor | None = None,
         every_position: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         if isinstance(cache, PackedBatchCache):
             return self._forward_packed(
                 input_ids, cache, every_position=every_position
@@ -84,17 +105,15 @@ class Qwen3Model(nn.Module):
             mask = key_positions[None, None, :] <= query_positions[:, :, None]
             mask &= key_positions[None, None, :] < ends[:, None, None]
             mask = mask[:, None, :, :]
+        rope = self._rope(tokens, start_pos=slot_starts[0], position_ids=position_ids)
         for index, block in enumerate(self.blocks):
             x = block(
                 x,
                 mask,
-                self.cos,
-                self.sin,
+                rope,
                 is_causal=is_causal,
-                start_pos=slot_starts[0],
                 cache=cache,
                 layer_index=index,
-                position_ids=position_ids,
                 cache_slots=cache_slots,
             )
         if cache is not None:
@@ -108,23 +127,19 @@ class Qwen3Model(nn.Module):
         cache: PackedBatchCache,
         *,
         every_position: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         if input_ids.shape != (1, sum(cache.counts)):
             raise ValueError("Packed input does not match query lengths.")
         x = self.token_embedding(input_ids)
+        rope = self._rope(input_ids.shape[1], position_ids=cache.positions)
         for index, block in enumerate(self.blocks):
-            x = block(
-                x,
-                None,
-                self.cos,
-                self.sin,
-                cache=cache,
-                layer_index=index,
-                position_ids=cache.positions,
-            )
+            x = block(x, None, rope, cache=cache, layer_index=index)
         cache.advance_packed()
         if every_position:
             return self.output(self.final_norm(x).to(self.config.dtype))[0]
+        if cache.last_indices is None:
+            # No row in this forward samples a token, so the vocabulary head is skipped.
+            return None
         x = x.index_select(1, cache.last_indices)
         return self.output(self.final_norm(x).to(self.config.dtype))[0]
 
@@ -137,16 +152,9 @@ class Qwen3Model(nn.Module):
     ) -> torch.Tensor:
         cache = DecodeKVCache(layers, position_ids)
         x = self.token_embedding(input_ids)
+        rope = self._rope(input_ids.shape[1], position_ids=position_ids)
         for index, block in enumerate(self.blocks):
-            x = block(
-                x,
-                mask,
-                self.cos,
-                self.sin,
-                cache=cache,
-                layer_index=index,
-                position_ids=position_ids,
-            )
+            x = block(x, mask, rope, cache=cache, layer_index=index)
         return self.output(self.final_norm(x).to(self.config.dtype))
 
     def _forward_uniform_cache(
@@ -170,17 +178,15 @@ class Qwen3Model(nn.Module):
                 is_causal = True
             else:
                 mask = causal_lower_right(tokens, end_pos)
+        rope = self._rope(tokens, start_pos=start_pos, position_ids=position_ids)
         for index, block in enumerate(self.blocks):
             x = block(
                 x,
                 mask,
-                self.cos,
-                self.sin,
+                rope,
                 is_causal=is_causal,
-                start_pos=start_pos,
                 cache=cache,
                 layer_index=index,
-                position_ids=position_ids,
             )
         if cache is not None:
             cache.advance(tokens)

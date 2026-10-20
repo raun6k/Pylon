@@ -255,6 +255,27 @@ class PrefixCache:
             matched.append(cached)
         return PrefixCacheHit(tuple(matched)) if matched else None
 
+    def cached_run(
+        self, block_hashes: Sequence[int], start: int
+    ) -> tuple[CachedBlock, ...]:
+        """Cached blocks that continue a prompt from block `start`, in order.
+
+        The chained hash covers every earlier token, so a hit at `start` matches the
+        prompt even when the caller computed the earlier blocks itself.
+        """
+        now = self._clock()
+        self._purge_expired(now)
+        matched: list[CachedBlock] = []
+        for block_hash in block_hashes[start:]:
+            cached = self._blocks.get(block_hash)
+            if cached is None:
+                break
+            cached.hit_count += 1
+            cached.expires_at = now + self.ttl_seconds
+            self._blocks.move_to_end(block_hash)
+            matched.append(cached)
+        return tuple(matched)
+
     def admit_resident_blocks(
         self,
         prompts: Sequence[ResidentPrompt],

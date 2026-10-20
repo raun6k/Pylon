@@ -201,6 +201,7 @@ class CudaGraphDecodeTests(unittest.TestCase):
             model_revision="rev",
             report=None,
             scheduler_snapshot=lambda: {"waiting": [], "active": []},
+            serving_config=lambda: {"cuda_graphs": True},
             cuda_graph_batch_sizes=engine.cuda_graph_batch_sizes,
         )
         frontend._decode_warmup_batch_sizes = (1, 2, 3)
@@ -347,11 +348,12 @@ class CudaGraphDecodeTests(unittest.TestCase):
         self.assertFalse(result_flags("pylon")["prefix_cache"])
         self.assertFalse(result_flags("pylon")["speculation"])
         self.assertEqual(eager["PYLON_ADMIT_SKIP"], "0")
-        self.assertEqual(pylon["PYLON_ADMIT_SKIP"], "0")
+        self.assertEqual(pylon["PYLON_ADMIT_SKIP"], "4")
         self.assertEqual(result_flags("eager", eager)["admit_skip"], 0)
         self.assertEqual(result_flags("pylon")["admit_skip"], 0)
-        self.assertEqual(result_flags("pylon", pylon)["admit_skip"], 0)
-        self.assertTrue(result_flags("vllm")["prefix_cache"])
+        self.assertEqual(result_flags("pylon", pylon)["admit_skip"], 4)
+        self.assertFalse(result_flags("vllm")["prefix_cache"])
+        self.assertTrue(result_flags("vllm", prefix_cache=True)["prefix_cache"])
 
     def test_replay_matches_eager_decode_on_cuda(self) -> None:
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:

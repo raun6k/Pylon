@@ -18,7 +18,7 @@ from pylon.prefix.cache import (
     describe_prompt_blocks,
 )
 from pylon.scheduler.admit import admit_requests
-from pylon.scheduler.batch import one_prefill_chunk
+from pylon.scheduler.batch import prefill_chunks
 from pylon.scheduler.queue import Job, Scheduler
 from pylon.spec.ngram import PromptNgram, accept_greedy, verification_tokens
 
@@ -193,6 +193,17 @@ class Engine:
             num_pages * page_size * self.capacity.bytes_per_token
         )
 
+    def serving_config(self) -> dict[str, object]:
+        config = self._config
+        return {
+            "cuda_graphs": config.cuda_graphs,
+            "prefix_cache": config.prefix_cache,
+            "speculation": config.speculate_k > 1,
+            "admit_skip": config.admit_skip,
+            "max_batch_size": config.max_batch_size,
+            "prefill_chunk_size": config.prefill_chunk_size,
+        }
+
     def scheduler_snapshot(self) -> dict[str, object]:
         return self._scheduler.snapshot()
 
@@ -261,22 +272,71 @@ class Engine:
             for active in self._active_requests
             if active.pending_token_id is not None
         ]
-        if decoding:
-            self._run_decode_wave(decoding)
         now = time.perf_counter()
-        if skip_prefill_wave(
+        prefill = []
+        if not skip_prefill_wave(
             len(decoding),
             self._max_batch_size,
             oldest_prefill_age(self._active_requests, now),
         ):
+            prefill = prefill_chunks(
+                self._active_requests,
+                self._prefill_chunk_size,
+                now,
+                self._attach_cached_prefix,
+            )
+        if decoding and self._speculate_k > 1:
+            # Draft verification runs its own forwards, so prefill packs alone.
+            self._run_decode_wave(decoding)
+            decoding = []
+        # Decode rows and prompt chunks share one forward, so the weights are read once
+        # per tick. A tick with no prompt work replays the decode graph instead.
+        selected = [*decoding, *(active for active, _tokens in prefill)]
+        chunks = [
+            *([active.pending_token_id] for active in decoding),
+            *(tokens for _active, tokens in prefill),
+        ]
+        if selected:
+            self._execute_batch(selected, chunks)
+
+    def _attach_cached_prefix(self, active: _ActiveRequest) -> None:
+        """Reuse prompt blocks another request published after this one was admitted."""
+        if not self.prefix_cache_enabled:
             return
-        chosen = one_prefill_chunk(
-            self._active_requests, self._prefill_chunk_size, now
+        block_size = self.prefix_cache.block_size
+        offset = active.prompt_offset
+        cache = active.cache
+        if (
+            offset % block_size
+            or cache.length != offset
+            or len(cache.pages) * block_size != offset
+        ):
+            return
+        block_hashes = [
+            view.hash for view in active.prompt_blocks if view.token_count == block_size
+        ]
+        # Keep at least one prompt token to compute so the last chunk yields logits.
+        usable = (len(active.request.input_ids) - 1) // block_size
+        started = time.perf_counter()
+        blocks = self.prefix_cache.cached_run(
+            block_hashes[:usable], offset // block_size
         )
-        if chosen is None:
+        if not blocks:
             return
-        active, tokens = chosen
-        self._execute_batch([active], [tokens], decode=False)
+        cache.append_blocks([block.snapshot for block in blocks])
+        attached = len(blocks) * block_size
+        first = offset // block_size
+        active.prompt_offset += attached
+        active.hit_tokens += attached
+        active.restored_tokens += attached
+        active.restore_seconds += time.perf_counter() - started
+        active.admitted_blocks = active.prompt_offset // block_size
+        active.prompt_blocks = tuple(
+            replace(view, status="hit")
+            if first <= view.index < first + len(blocks)
+            else view
+            for view in active.prompt_blocks
+        )
 
     def _start_request(self, job: Job, reservation_bytes: int, reserved_memory_bytes: int) -> None:
         request = job.payload
@@ -340,9 +400,16 @@ class Engine:
         self,
         selected: list[_ActiveRequest],
         chunks: list[list[int]],
-        *,
-        decode: bool,
     ) -> None:
+        decode_only = all(active.pending_token_id is not None for active in selected)
+        # Rows that sample a token: every decode row, and a prompt chunk that ends the
+        # prompt. Other prompt chunks skip the vocabulary head.
+        ready_rows = [
+            row
+            for row, (active, chunk) in enumerate(zip(selected, chunks, strict=True))
+            if active.pending_token_id is not None
+            or active.prompt_offset + len(chunk) >= len(active.request.input_ids)
+        ]
         started = time.perf_counter()
         device = self.decoder.device
         events = None
@@ -355,7 +422,7 @@ class Engine:
                 )
             events = self._decode_events
             events[0].record(stream)
-        if decode:
+        if decode_only:
             logits = self.decoder.decode_caches(
                 [active.cache for active in selected],
                 [chunk[0] for chunk in chunks],
@@ -364,19 +431,15 @@ class Engine:
             logits = self.decoder.packed_caches(
                 [active.cache for active in selected],
                 chunks,
+                logit_rows=ready_rows,
             )
         if events is not None:
             events[1].record(stream)
-        ready = []
-        rows = []
-        for row, (active, chunk) in enumerate(zip(selected, chunks, strict=True)):
+        for active, chunk in zip(selected, chunks, strict=True):
             if active.pending_token_id is None:
                 active.prompt_offset += len(chunk)
                 active.prefill_wait_started = time.perf_counter()
-                if active.prompt_offset < len(active.request.input_ids):
-                    continue
-            ready.append(active)
-            rows.append(row)
+        ready = [selected[row] for row in ready_rows]
         self._publish_resident_blocks()
         if not ready:
             self.decoder._synchronize()
@@ -388,7 +451,6 @@ class Engine:
             for active in selected:
                 active.prefill_seconds += elapsed
             return
-        logits = logits[rows]
         if all(active.request.sampling.temperature == 0 for active in ready):
             sampled = logits.argmax(dim=-1)
         elif all(
@@ -433,13 +495,6 @@ class Engine:
         self.prefix_cache.reserve(self._reserved_memory_bytes())
 
     def _run_decode_wave(self, decoding: list[_ActiveRequest]) -> None:
-        if self._speculate_k <= 1:
-            self._execute_batch(
-                decoding,
-                [[active.pending_token_id] for active in decoding],
-                decode=True,
-            )
-            return
         misses: list[_ActiveRequest] = []
         hits: list[tuple[_ActiveRequest, tuple[int, ...]]] = []
         for active in decoding:
@@ -452,7 +507,6 @@ class Engine:
             self._execute_batch(
                 misses,
                 [[active.pending_token_id] for active in misses],
-                decode=True,
             )
         if hits:
             self._verify_drafts(hits)

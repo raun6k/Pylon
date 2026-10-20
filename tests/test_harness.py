@@ -20,6 +20,7 @@ from benchmarks.run import (
     ordered_lines,
     parse_used_gpu_memory,
     percentile,
+    prefix_cache_groups,
     query_gpu_identity,
     result_flags,
     reuse_running_server,
@@ -27,6 +28,8 @@ from benchmarks.run import (
     stop_process,
     summarize,
     system_environ,
+    vllm_argv,
+    workload_prefix_cache,
     write_comparison_plots,
 )
 
@@ -232,18 +235,41 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(reuse_running_server(["eager"], "eager"))
         self.assertFalse(reuse_running_server(["eager", "pylon"], "eager"))
 
-    def test_pylon_column_enables_graphs_and_leaves_eager_flags_off(self) -> None:
+    def test_pylon_column_enables_graphs_and_admit_skip(self) -> None:
         env = system_environ({}, "pylon")
         self.assertEqual(env["PYLON_CUDA_GRAPHS"], "true")
         self.assertEqual(env["PYLON_PREFIX_CACHE"], "false")
         self.assertEqual(env["PYLON_SPECULATE_K"], "1")
-        self.assertEqual(env["PYLON_ADMIT_SKIP"], "0")
+        self.assertEqual(env["PYLON_ADMIT_SKIP"], "4")
+        self.assertEqual(system_environ({"PYLON_ADMIT_SKIP": "0"}, "pylon")["PYLON_ADMIT_SKIP"], "0")
         self.assertTrue(result_flags("pylon", env)["cuda_graphs"])
         self.assertFalse(result_flags("pylon", env)["speculation"])
-        self.assertEqual(result_flags("pylon", env)["admit_skip"], 0)
+        self.assertEqual(result_flags("pylon", env)["admit_skip"], 4)
         self.assertFalse(result_flags("pylon", env)["prefix_cache"])
         self.assertFalse(result_flags("vllm", None)["speculation"])
-        self.assertTrue(result_flags("vllm", None)["prefix_cache"])
+
+    def test_prefix_cache_follows_the_workload_for_pylon_and_vllm(self) -> None:
+        self.assertFalse(workload_prefix_cache("decode_heavy"))
+        self.assertFalse(workload_prefix_cache("prefill_heavy"))
+        self.assertTrue(workload_prefix_cache("shared_prefix"))
+        workloads = ["decode_heavy", "prefill_heavy", "shared_prefix"]
+        self.assertEqual(
+            prefix_cache_groups("pylon", workloads),
+            [(False, ["decode_heavy", "prefill_heavy"]), (True, ["shared_prefix"])],
+        )
+        self.assertEqual(prefix_cache_groups("vllm", workloads), prefix_cache_groups("pylon", workloads))
+        self.assertEqual(prefix_cache_groups("eager", workloads), [(False, workloads)])
+        cached = system_environ({}, "pylon", prefix_cache=True)
+        self.assertEqual(cached["PYLON_PREFIX_CACHE"], "true")
+        self.assertTrue(result_flags("pylon", cached)["prefix_cache"])
+        self.assertFalse(result_flags("eager", system_environ({}, "eager"), prefix_cache=True)["prefix_cache"])
+        self.assertIn("--enable-prefix-caching", vllm_argv(True))
+        self.assertNotIn("--no-enable-prefix-caching", vllm_argv(True))
+        self.assertIn("--no-enable-prefix-caching", vllm_argv(False))
+        self.assertNotIn("--enable-prefix-caching", vllm_argv(False))
+        self.assertEqual(len(vllm_argv(False)), len(VLLM_ARGV))
+        self.assertTrue(result_flags("vllm", None, prefix_cache=True)["prefix_cache"])
+        self.assertFalse(result_flags("vllm", None, prefix_cache=False)["prefix_cache"])
 
     def test_plots_use_decode_heavy_p50_and_throughput(self) -> None:
         records = []

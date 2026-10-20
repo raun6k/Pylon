@@ -57,17 +57,25 @@ class Qwen3Weights:
         }
         for index, block in enumerate(model.blocks):
             prefix = f"model.layers.{index}"
+            attention = block.attention
+            # Fused projections load each checkpoint matrix into its own row range.
+            query, key, value = attention.qkv.weight.split(
+                (attention.query_size, attention.kv_size, attention.kv_size)
+            )
+            gate, up = block.feed_forward.gate_up.weight.split(
+                block.feed_forward.hidden_dim
+            )
             targets.update(
                 {
-                    f"{prefix}.self_attn.q_proj.weight": block.attention.query.weight,
-                    f"{prefix}.self_attn.k_proj.weight": block.attention.key.weight,
-                    f"{prefix}.self_attn.v_proj.weight": block.attention.value.weight,
+                    f"{prefix}.self_attn.q_proj.weight": query,
+                    f"{prefix}.self_attn.k_proj.weight": key,
+                    f"{prefix}.self_attn.v_proj.weight": value,
                     f"{prefix}.self_attn.o_proj.weight": block.attention.output.weight,
                     f"{prefix}.self_attn.q_norm.weight": block.attention.q_norm.scale,
                     f"{prefix}.self_attn.k_norm.weight": block.attention.k_norm.scale,
                     f"{prefix}.input_layernorm.weight": block.input_norm.scale,
-                    f"{prefix}.mlp.gate_proj.weight": block.feed_forward.gate.weight,
-                    f"{prefix}.mlp.up_proj.weight": block.feed_forward.up.weight,
+                    f"{prefix}.mlp.gate_proj.weight": gate,
+                    f"{prefix}.mlp.up_proj.weight": up,
                     f"{prefix}.mlp.down_proj.weight": block.feed_forward.down.weight,
                     f"{prefix}.post_attention_layernorm.weight": block.post_attention_norm.scale,
                 }

@@ -19,7 +19,7 @@ from pylon.kv.pool import KVPagePool
 from pylon.model.config import Qwen3Config
 from pylon.prefix.cache import hash_token_blocks
 from pylon.scheduler.admit import ADMIT_SKIP_WAIT_SECONDS
-from pylon.scheduler.batch import PREFILL_MAX_WAIT_SECONDS, pack_tick
+from pylon.scheduler.batch import PREFILL_MAX_WAIT_SECONDS, prefill_chunks
 
 
 class FakeDecoder:
@@ -30,6 +30,8 @@ class FakeDecoder:
         self.graphs = None
         self.prefill_chunk_sizes: list[int] = []
         self.forwards: list[tuple[str, list]] = []
+        self.logit_rows: list[list[int] | None] = []
+        self.decoding_caches: set[int] = set()
         self._planned: list[int] = []
         self._token_for_cache: dict[int, int] = {}
 
@@ -69,14 +71,27 @@ class FakeDecoder:
             restored_tokens=cache.length,
         )
 
-    def packed_caches(self, caches: list, chunks: list[list[int]]) -> torch.Tensor:
+    def packed_caches(
+        self, caches: list, chunks: list[list[int]], *, logit_rows=None
+    ) -> torch.Tensor | None:
         counts = [len(chunk) for chunk in chunks]
-        self.prefill_chunk_sizes.extend(counts)
-        self.forwards.append(("prefill", [list(chunk) for chunk in chunks]))
+        self.prefill_chunk_sizes.extend(
+            count for cache, count in zip(caches, counts) if not self._decoding(cache)
+        )
+        self.forwards.append(("packed", [list(chunk) for chunk in chunks]))
+        self.logit_rows.append(None if logit_rows is None else list(logit_rows))
         batch = PackedBatchCache(caches)
-        batch.prepare_packed(counts)
+        batch.prepare_packed(counts, logit_rows)
         batch.advance_packed()
-        return self._logits(caches)
+        rows = range(len(caches)) if logit_rows is None else logit_rows
+        # A row that gets logits samples a token, so its cache decodes from now on.
+        self.decoding_caches.update(id(caches[row]) for row in rows)
+        if not rows:
+            return None
+        return self._logits([caches[row] for row in rows])
+
+    def _decoding(self, cache) -> bool:
+        return id(cache) in self.decoding_caches
 
     def decode_caches(self, caches: list, token_ids: list[int]) -> torch.Tensor:
         self.forwards.append(("decode", [[token_id] for token_id in token_ids]))
@@ -332,6 +347,35 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.assertEqual(restored.prefix.hit_tokens, 256)
         self.assertEqual(restored.prefix.restored_tokens, 256)
 
+    def test_requests_admitted_together_reuse_a_prefix_published_after_admission(self) -> None:
+        engine = self.make_engine(slots=8, budget_tokens=32768, prefill_chunk_size=2048)
+        shared = [(index % 63) + 1 for index in range(512)]
+        futures = [
+            self.enqueue(
+                engine,
+                f"r{row}",
+                shared + [((row * 5 + index) % 63) + 1 for index in range(128)],
+                1,
+            )
+            for row in range(8)
+        ]
+        self.finish(engine, *futures)
+        restored = [future.result(timeout=0).prefix.restored_tokens for future in futures]
+        # r0 sights the blocks, r1 pins them, r2 and r3 started in the same tick, and
+        # every later request attaches the 512 cached tokens before its first chunk.
+        self.assertEqual(restored, [0, 0, 0, 0, 512, 512, 512, 512])
+        statuses = [view.status for view in futures[4].result(timeout=0).prefix.prompt_blocks]
+        self.assertEqual(statuses, ["hit", "hit", "partial"])
+        prefill_tokens = sum(
+            len(chunk)
+            for name, chunks in self.decoder.forwards
+            for chunk in chunks
+            if name == "packed" and len(chunk) > 1
+        )
+        self.assertEqual(prefill_tokens, 4 * 640 + 4 * 128)
+        pool = engine.decoder.page_pool
+        self.assertEqual(pool.free_pages, pool.num_pages - 2)
+
     def test_prefix_cache_flag_stores_nothing(self) -> None:
         engine = self.make_engine(
             budget_tokens=1024, prefill_chunk_size=256, prefix_cache=False
@@ -427,28 +471,41 @@ class ContinuousBatchingTests(unittest.TestCase):
             prompt_offset=0,
             request=SimpleNamespace(input_ids=[2] * 20),
         )
-        selected, chunks = pack_tick(
-            [fresh, aged, decoding], prefill_chunk_size=4, now=now
-        )
-        self.assertEqual(selected[0], decoding)
-        self.assertEqual(chunks[0], [4])
-        self.assertEqual(selected[1], aged)
-        self.assertEqual(chunks[1], [2, 2, 2])
-        self.assertNotIn(fresh, selected)
+        chosen = prefill_chunks([fresh, aged, decoding], token_budget=4, now=now)
+        self.assertEqual(chosen, [(aged, [2, 2, 2, 2])])
+        chosen = prefill_chunks([fresh, aged, decoding], token_budget=30, now=now)
+        self.assertEqual(chosen, [(aged, [2] * 20), (fresh, [1] * 10)])
 
-    def test_one_tick_prefills_a_single_chunk(self) -> None:
+    def test_one_tick_packs_every_prompt_that_fits_the_budget(self) -> None:
         engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=8)
         first = self.enqueue(engine, "first", [1, 2, 3, 4], 1)
         second = self.enqueue(engine, "second", [6, 7, 8, 9], 1)
         self.tick(engine)
+        self.assertEqual(engine._active_requests, [])
         self.assertEqual(
-            [active.request.request_id for active in engine._active_requests],
-            ["second"],
+            self.decoder.forwards, [("packed", [[1, 2, 3, 4], [6, 7, 8, 9]])]
         )
-        self.assertEqual(engine._active_requests[0].prompt_offset, 0)
-        self.assertEqual(self.decoder.prefill_chunk_sizes, [4])
+        self.assertEqual(self.decoder.logit_rows, [[0, 1]])
         self.assertEqual(first.result(timeout=0).output_ids, [5])
-        self.assertEqual([name for name, _ in self.decoder.forwards], ["prefill"])
+        self.assertEqual(second.result(timeout=0).output_ids, [5])
+
+    def test_eight_prompts_share_forwards_instead_of_one_each(self) -> None:
+        engine = self.make_engine(slots=8, budget_tokens=32768, prefill_chunk_size=2048)
+        futures = [
+            self.enqueue(engine, f"r{index}", [index + 1] * 512, 1) for index in range(8)
+        ]
+        self.tick(engine)
+        self.tick(engine)
+        self.assertTrue(all(future.done() for future in futures))
+        self.assertEqual(
+            [len(chunks) for _name, chunks in self.decoder.forwards], [4, 4]
+        )
+
+    def test_a_chunk_that_does_not_end_the_prompt_skips_the_vocabulary_head(self) -> None:
+        engine = self.make_engine(slots=2, budget_tokens=8192, prefill_chunk_size=4)
+        future = self.enqueue(engine, "long", list(range(1, 11)), 1)
+        self.finish(engine, future)
+        self.assertEqual(self.decoder.logit_rows, [[], [], [0]])
 
     def test_prefill_chunk_is_not_shrunk_by_decode_tokens(self) -> None:
         engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=4)
@@ -459,21 +516,21 @@ class ContinuousBatchingTests(unittest.TestCase):
         prefill = engine._active_requests[1]
         self.assertEqual(decode.request.request_id, "decode")
         self.assertIsNotNone(decode.pending_token_id)
-        self.assertEqual(prefill.prompt_offset, 0)
+        self.assertEqual(prefill.prompt_offset, 1)
         prefill_seconds = decode.prefill_seconds
         intervals = len(decode.inter_token_seconds)
         self.decoder.forwards.clear()
         self.tick(engine)
         self.assertEqual(
-            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
+            self.decoder.forwards,
+            [("packed", [[decode.output_ids[-2]], [4, 4, 4, 4]])],
         )
-        self.assertEqual(self.decoder.forwards[1][1], [[4, 4, 4, 4]])
-        self.assertEqual(prefill.prompt_offset, 4)
+        self.assertEqual(prefill.prompt_offset, 5)
         self.assertEqual(len(decode.inter_token_seconds), intervals + 1)
         self.assertEqual(decode.prefill_seconds, prefill_seconds)
         self.assertGreater(prefill.prefill_seconds, 0)
 
-    def test_decode_wave_replays_the_graph_and_prefill_stays_eager(self) -> None:
+    def test_decode_only_tick_replays_the_graph_and_a_mixed_tick_stays_eager(self) -> None:
         engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=4)
         replayed: list[int] = []
 
@@ -485,15 +542,17 @@ class ContinuousBatchingTests(unittest.TestCase):
 
         self.decoder.graphs = Graphs()
         self.enqueue(engine, "decode", [1, 2, 3], 8)
-        self.enqueue(engine, "prefill", [4] * 12, 1)
         self.tick(engine)
-        replayed.clear()
         self.decoder.forwards.clear()
         self.tick(engine)
         self.assertEqual(replayed, [1])
-        self.assertEqual(
-            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
-        )
+        self.assertEqual([name for name, _ in self.decoder.forwards], ["decode"])
+        self.enqueue(engine, "prefill", [4] * 12, 1)
+        replayed.clear()
+        self.decoder.forwards.clear()
+        self.tick(engine)
+        self.assertEqual(replayed, [])
+        self.assertEqual([name for name, _ in self.decoder.forwards], ["packed"])
 
     def test_full_decode_batch_holds_a_young_prefill(self) -> None:
         engine = self.make_engine(slots=1, budget_tokens=4096, prefill_chunk_size=4)
@@ -522,10 +581,8 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.decoder.forwards.clear()
         self.tick(engine)
         self.assertEqual(prefill.prompt_offset, 4)
-        self.assertEqual(
-            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
-        )
-        self.assertEqual(self.decoder.forwards[1][1], [[4, 4, 4, 4]])
+        self.assertEqual([name for name, _ in self.decoder.forwards], ["packed"])
+        self.assertEqual(self.decoder.forwards[0][1][1], [4, 4, 4, 4])
 
     def test_young_prefill_still_runs_when_the_decode_batch_is_not_full(self) -> None:
         engine = self.make_engine(slots=2, budget_tokens=8192, prefill_chunk_size=4)
@@ -533,13 +590,12 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.enqueue(engine, "prefill", [4] * 12, 1)
         self.tick(engine)
         prefill = engine._active_requests[1]
+        offset = prefill.prompt_offset
         prefill.prefill_wait_started = time.perf_counter()
         self.decoder.forwards.clear()
         self.tick(engine)
-        self.assertEqual(prefill.prompt_offset, 4)
-        self.assertEqual(
-            [name for name, _ in self.decoder.forwards], ["decode", "prefill"]
-        )
+        self.assertEqual(prefill.prompt_offset, offset + 4)
+        self.assertEqual([name for name, _ in self.decoder.forwards], ["packed"])
 
     def test_aged_prefill_gets_the_only_chunk(self) -> None:
         engine = self.make_engine(slots=4, budget_tokens=8192, prefill_chunk_size=4)
@@ -549,15 +605,16 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.tick(engine)
         fresh = engine._active_requests[1]
         aged = engine._active_requests[2]
+        fresh_offset = fresh.prompt_offset
         now = time.perf_counter()
         fresh.prefill_wait_started = now - 0.01
         aged.prefill_wait_started = now - PREFILL_MAX_WAIT_SECONDS
         self.decoder.forwards.clear()
         self.tick(engine)
-        self.assertEqual(fresh.prompt_offset, 0)
+        self.assertEqual(fresh.prompt_offset, fresh_offset)
         self.assertEqual(aged.prompt_offset, 4)
-        self.assertEqual(self.decoder.forwards[0][0], "decode")
-        self.assertEqual(self.decoder.forwards[1][1], [[8, 8, 8, 8]])
+        self.assertEqual(self.decoder.forwards[0][0], "packed")
+        self.assertEqual(self.decoder.forwards[0][1][1:], [[8, 8, 8, 8]])
 
     def test_skip_threshold_is_under_100ms_on_a_full_batch_only(self) -> None:
         self.assertEqual(FULL_BATCH_PREFILL_WAIT_SECONDS, 0.1)
@@ -830,16 +887,17 @@ class AdmitSkipConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PylonConfig(admit_skip=True)
 
-    def test_eager_and_pylon_columns_force_skip_off(self) -> None:
+    def test_eager_forces_skip_off_and_pylon_keeps_the_slice_value(self) -> None:
         base = {"PYLON_ADMIT_SKIP": "9", "PYLON_PREFIX_CACHE": "true"}
         eager = system_environ(base, "eager")
         pylon = system_environ(base, "pylon")
         self.assertEqual(eager["PYLON_ADMIT_SKIP"], "0")
-        self.assertEqual(pylon["PYLON_ADMIT_SKIP"], "0")
+        self.assertEqual(pylon["PYLON_ADMIT_SKIP"], "9")
+        self.assertEqual(system_environ({}, "pylon")["PYLON_ADMIT_SKIP"], "4")
         self.assertEqual(result_flags("eager", eager)["admit_skip"], 0)
         self.assertEqual(result_flags("eager", {"PYLON_ADMIT_SKIP": "4"})["admit_skip"], 0)
         self.assertEqual(result_flags("pylon")["admit_skip"], 0)
-        self.assertEqual(result_flags("pylon", pylon)["admit_skip"], 0)
+        self.assertEqual(result_flags("pylon", pylon)["admit_skip"], 9)
         self.assertEqual(result_flags("vllm")["admit_skip"], 0)
 
 

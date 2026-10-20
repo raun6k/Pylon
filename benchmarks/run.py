@@ -48,6 +48,35 @@ VLLM_ARGV = (
     "--enable-prompt-tokens-details",
 )
 LINE_ORDER = ("eager", "pylon", "vllm")
+# Prefix caching is set per workload and applied the same way to pylon and vLLM. Each
+# repeat replays the same 32 prompts, so a cache would turn decode_heavy and
+# prefill_heavy into cache-hit runs. Only shared_prefix measures the cache.
+WORKLOAD_PREFIX_CACHE = {
+    "decode_heavy": False,
+    "prefill_heavy": False,
+    "shared_prefix": True,
+}
+
+
+def workload_prefix_cache(workload: str) -> bool:
+    return WORKLOAD_PREFIX_CACHE.get(workload, False)
+
+
+def vllm_argv(prefix_cache: bool) -> tuple[str, ...]:
+    flag = "--enable-prefix-caching" if prefix_cache else "--no-enable-prefix-caching"
+    return tuple(
+        flag if arg == "--enable-prefix-caching" else arg for arg in VLLM_ARGV
+    )
+
+
+def prefix_cache_groups(system: str, workloads: list[str]) -> list[tuple[bool, list[str]]]:
+    """Workloads grouped by the prefix-cache setting one server process runs with."""
+    if system == "eager":
+        return [(False, list(workloads))]
+    groups: dict[bool, list[str]] = {}
+    for workload in workloads:
+        groups.setdefault(workload_prefix_cache(workload), []).append(workload)
+    return list(groups.items())
 
 WARMUP_MESSAGES = (
     {"role": "user", "content": "Reply with the single word pylon."},
@@ -532,7 +561,9 @@ def _wait_vllm(base_url: str, timeout: float) -> dict[str, Any]:
     raise RuntimeError(f"vLLM /health was not ready at {base_url}.")
 
 
-def system_environ(base: dict[str, str], system: str) -> dict[str, str]:
+def system_environ(
+    base: dict[str, str], system: str, *, prefix_cache: bool = False
+) -> dict[str, str]:
     env = dict(base)
     if system == "eager":
         env["PYLON_CUDA_GRAPHS"] = "false"
@@ -541,28 +572,27 @@ def system_environ(base: dict[str, str], system: str) -> dict[str, str]:
         env["PYLON_ADMIT_SKIP"] = "0"
     elif system == "pylon":
         env["PYLON_CUDA_GRAPHS"] = "true"
-        env["PYLON_PREFIX_CACHE"] = "false"
+        env["PYLON_PREFIX_CACHE"] = "true" if prefix_cache else "false"
         env["PYLON_SPECULATE_K"] = "1"
-        env["PYLON_ADMIT_SKIP"] = "0"
+        env.setdefault("PYLON_ADMIT_SKIP", "4")
     return env
 
 
 def result_flags(
-    system: str, env: dict[str, str] | None = None
+    system: str, env: dict[str, str] | None = None, *, prefix_cache: bool = False
 ) -> dict[str, object]:
     speculate_k = 1
     if env is not None and "PYLON_SPECULATE_K" in env:
         speculate_k = int(env["PYLON_SPECULATE_K"])
-    if system == "pylon":
-        admit_skip = 0
-        if env is not None and "PYLON_ADMIT_SKIP" in env:
-            admit_skip = int(env["PYLON_ADMIT_SKIP"])
-    else:
-        admit_skip = 0
+    admit_skip = 0
+    if system == "pylon" and env is not None and "PYLON_ADMIT_SKIP" in env:
+        admit_skip = int(env["PYLON_ADMIT_SKIP"])
+    if system == "pylon" and env is not None:
+        prefix_cache = env.get("PYLON_PREFIX_CACHE", "false").lower() in {"1", "true"}
     return {
         "cuda_graphs": system == "pylon",
         "speculation": speculate_k > 1,
-        "prefix_cache": system not in {"eager", "pylon"},
+        "prefix_cache": system != "eager" and prefix_cache,
         "admit_skip": admit_skip,
     }
 
@@ -588,13 +618,15 @@ def stop_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5)
 
 
-def _spawn_system(system: str) -> tuple[subprocess.Popen[bytes], str]:
+def _spawn_system(
+    system: str, *, prefix_cache: bool
+) -> tuple[subprocess.Popen[bytes], str]:
     if system == "vllm":
-        command = list(VLLM_ARGV)
+        command = list(vllm_argv(prefix_cache))
         env = os.environ.copy()
         url = VLLM_URL
     else:
-        env = system_environ(os.environ.copy(), system)
+        env = system_environ(os.environ.copy(), system, prefix_cache=prefix_cache)
         command = [sys.executable, "-m", "pylon"]
         url = "http://127.0.0.1:8000"
     try:
@@ -807,17 +839,26 @@ def main() -> None:
     identity = query_gpu_identity()
     runtime = pytorch_versions()
     records = []
-    for system in systems:
+    vllm_argvs: list[list[str]] = []
+    runs = [
+        (system, prefix_cache, group)
+        for system in systems
+        for prefix_cache, group in prefix_cache_groups(system, workloads)
+    ]
+    for system, prefix_cache, group in runs:
         base_url = VLLM_URL if system == "vllm" else args.base_url
         existing = (
             _health_ok(base_url, args.timeout)
-            if reuse_running_server(systems, system)
+            if reuse_running_server(systems, system) and len(runs) == 1
             else None
         )
         process = None
+        argv = list(vllm_argv(prefix_cache)) if system == "vllm" else None
+        if argv is not None and argv not in vllm_argvs:
+            vllm_argvs.append(argv)
         try:
             if existing is None:
-                process, base_url = _spawn_system(system)
+                process, base_url = _spawn_system(system, prefix_cache=prefix_cache)
                 health = (
                     _wait_vllm(base_url, args.timeout)
                     if system == "vllm"
@@ -826,21 +867,31 @@ def main() -> None:
             else:
                 health = existing
             spawn_env = (
-                None if system == "vllm" else system_environ(os.environ.copy(), system)
+                None
+                if system == "vllm"
+                else system_environ(
+                    os.environ.copy(), system, prefix_cache=prefix_cache
+                )
             )
-            scheduler = health.get("scheduler") or {}
+            server_config = health.get("config") or {}
             if system == "vllm":
                 batch_cap = None
                 prefill_chunk = None
             else:
-                batch_cap = scheduler.get("max_batch_size")
-                if batch_cap is None:
-                    batch_cap = int((spawn_env or {}).get("PYLON_MAX_BATCH_SIZE", "8"))
-                prefill_chunk = int(
-                    (spawn_env or {}).get("PYLON_PREFILL_CHUNK_SIZE", "256")
+                batch_cap = server_config.get("max_batch_size") or int(
+                    (spawn_env or {}).get("PYLON_MAX_BATCH_SIZE", "32")
+                )
+                prefill_chunk = server_config.get("prefill_chunk_size") or int(
+                    (spawn_env or {}).get("PYLON_PREFILL_CHUNK_SIZE", "2048")
+                )
+            flags = result_flags(system, spawn_env, prefix_cache=prefix_cache)
+            if server_config:
+                # A reused server reports what it actually runs with.
+                flags.update(
+                    {key: server_config[key] for key in flags if key in server_config}
                 )
             model = health["model"]
-            for workload_name in workloads:
+            for workload_name in group:
                 path = WORKLOADS / f"{workload_name}.json"
                 rows = load_workload(path)
                 revision = health.get("model_revision") or cached_snapshot_revision()
@@ -923,9 +974,9 @@ def main() -> None:
                             "batch_cap": batch_cap,
                             "prefill_chunk_size": prefill_chunk,
                             "vllm_version": health.get("vllm_version"),
-                            "vllm_argv": list(VLLM_ARGV) if system == "vllm" else None,
+                            "vllm_argv": argv,
                             "summary": summary,
-                            "flags": result_flags(system, spawn_env),
+                            "flags": flags,
                             "samples": samples,
                         }
                     )
@@ -954,7 +1005,7 @@ def main() -> None:
         "driver_version": identity["driver_version"],
         "gpu_name": identity["gpu_name"],
         "vllm_version": observed_vllm,
-        "vllm_argv": list(VLLM_ARGV) if "vllm" in systems else None,
+        "vllm_argvs": vllm_argvs or None,
         "runs": records,
     }
     path.write_text(json.dumps(record, indent=2) + "\n")

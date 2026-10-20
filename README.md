@@ -6,7 +6,7 @@
 
 Pylon is a single-GPU inference server for [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507). The weights stay fixed. It exposes an OpenAI-compatible `POST /v1/chat/completions` endpoint.
 
-The additions on top of a normal serving loop are decode-first scheduling, CUDA-graph decode, a two-hit prefix cache, prompt n-gram verification, and skip-ahead admission.
+The additions on top of a normal serving loop are packed decode and prefill ticks, CUDA-graph decode, a two-hit prefix cache, prompt n-gram verification, and skip-ahead admission.
 
 On one NVIDIA L4, CUDA-graph decode beat this server's own eager path. Output speed went from 24.8 to 26.2 tokens/s at concurrency 1, and from 176.0 to 184.9 at concurrency 8. Speculation, the prefix cache, and admit-skip were off. Temperature was 0. This is not a comparison against another server.
 
@@ -23,9 +23,10 @@ On one NVIDIA L4, CUDA-graph decode beat this server's own eager path. Output sp
 
 ## What it does
 
-- **Decode-first scheduling.** Every step decodes the active batch, then prefills one 256-token chunk of a waiting prompt. If the batch is full and the oldest prompt has waited under 100 ms, prefill waits. Time to first token can rise.
-- **CUDA-graph decode.** The decode step is captured and replayed. That is the gain in the numbers above.
-- **Paged KV and a two-hit prefix cache.** KV lives in 256-token pages. A full page of prompt tokens is kept once the same block shows up again. `PYLON_PREFIX_CACHE=false` turns that off.
+- **Packed ticks.** Each step runs one forward: one token for every decoding request, plus up to `PYLON_PREFILL_CHUNK_SIZE` (default 2048) prompt tokens taken from as many waiting prompts as fit. Only rows that sample a token run the vocabulary head. If the batch is full and the oldest prompt has waited under 100 ms, the step decodes only. A long prompt in a step makes that step's inter-token gap longer.
+- **CUDA-graph decode.** A step with no prompt work replays a captured decode graph, one per batch size up to `PYLON_MAX_BATCH_SIZE` (default 32). That is the gain in the numbers above.
+- **Fused projections.** Q, K, and V share one matrix multiply, as do the gate and up projections. Rotary tables are gathered once per forward.
+- **Paged KV and a two-hit prefix cache.** KV lives in 256-token pages. A full page of prompt tokens is kept once the same block shows up again. A request admitted before that block was kept still picks it up before its first prompt chunk. `PYLON_PREFIX_CACHE=false` turns that off.
 - **Prompt n-gram speculation.** This provides a verify path for speculated tokens. It was off in the published benchmark.
 - **Skip-ahead admission.** Each request reserves its prompt and its full generation in pages. If the first waiter does not fit, a later one that does can start. `PYLON_ADMIT_SKIP` defaults to 4. A request that has waited 100 ms stays next.
 
@@ -42,7 +43,7 @@ On one NVIDIA L4, CUDA-graph decode beat this server's own eager path. Output sp
 
 > CUDA-graph decode on `decode_heavy` raised output tokens per second from 24.7970 to 26.1710 at concurrency 1 and from 176.0118 to 184.8867 at concurrency 8, which is 5.54% and 5.04% over the eager rows in `benchmarks/results/20261003T153549Z-graph-decode-heavy.json`. Inter-token p50 fell from 0.04026 s to 0.03815 s and from 0.04441 s to 0.04226 s, while time to first token p50 went from 0.05110 s to 0.05159 s at concurrency 1 and from 0.23770 s to 0.23339 s at concurrency 8. Every row still computed 12288 prefill tokens, and peak GPU memory rose from 21225275392 bytes to 21407727616 bytes.
 
-Benchmark setup: NVIDIA L4, Qwen/Qwen3-4B-Instruct-2507 snapshot `cdbee75f17c01a7cc42f958dc650907174af0554`, PyTorch 2.14.1+cu130, CUDA 13.0, driver 595.58.03, batch cap 8, prefill chunk 256, 32 requests, 3 repeats. `eager` means graphs off and `pylon` means graphs on.
+Benchmark setup: NVIDIA L4, Qwen/Qwen3-4B-Instruct-2507 snapshot `cdbee75f17c01a7cc42f958dc650907174af0554`, PyTorch 2.14.1+cu130, CUDA 13.0, driver 595.58.03, batch cap 8, prefill chunk 256, 32 requests, 3 repeats. `eager` means graphs off and `pylon` means graphs on. These rows were measured before prefill and decode shared one forward.
 
 ## Requirements
 
@@ -95,7 +96,7 @@ uv run python benchmarks/run.py \
   --label graph-decode-heavy
 ```
 
-`eager` means graphs off. `pylon` means graphs on. Both leave speculation, the prefix cache, and admit-skip off. This writes the table above. It does not compare against another server.
+`eager` turns off graphs, the prefix cache, speculation, and admit-skip. `pylon` turns on graphs and admit-skip 4 and leaves speculation off. The prefix cache follows the workload for `pylon` and for a `vllm` column: it is off for `decode_heavy` and `prefill_heavy`, whose repeats replay the same prompts, and on for `shared_prefix`. The table above was written by this command at batch cap 8 and prefill chunk 256 before those settings changed. It does not compare against another server.
 
 ## License
 

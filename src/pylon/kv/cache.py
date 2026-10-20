@@ -93,6 +93,27 @@ class PagedKVCache:
         self.pages = pages
         self.length = length
 
+    def append_blocks(self, blocks: Sequence[PagedKVBlockSnapshot]) -> None:
+        """Extend a page-aligned cache with cached prompt blocks that follow it."""
+        page_size = self.pool.page_size
+        if self._pending_tokens is not None or len(self.pages) * page_size != self.length:
+            raise RuntimeError("Cached blocks can only extend a page-aligned cache.")
+        pages: list[KVPage] = []
+        for block in blocks:
+            if (
+                block.length < 1
+                or block.length % page_size
+                or len(block.pages) * page_size != block.length
+                or any(page.pool is not self.pool for page in block.pages)
+            ):
+                raise ValueError("Paged K/V block does not belong to this aligned pool.")
+            pages.extend(block.pages)
+        length = self.length + len(pages) * page_size
+        if length > self.capacity:
+            raise ValueError("Paged K/V blocks do not fit within this request capacity.")
+        self.pages.extend(pages)
+        self.length = length
+
     def close(self) -> None:
         self.pages.clear()
         self.length = 0
@@ -357,7 +378,11 @@ def _gather_cpu(
 
 
 class PackedBatchCache(PagedBatchCache):
-    def prepare_packed(self, counts: Sequence[int]) -> None:
+    def prepare_packed(
+        self, counts: Sequence[int], logit_rows: Sequence[int] | None = None
+    ) -> None:
+        """Prepare one packed forward. `logit_rows` are the rows whose last token needs
+        logits; None means every row, and an empty sequence skips the vocabulary head."""
         if len(counts) != len(self.caches) or any(count < 1 for count in counts):
             raise ValueError("Each packed sequence needs at least one query token.")
         missing = []
@@ -405,8 +430,12 @@ class PackedBatchCache(PagedBatchCache):
             for position in range(cache.length, end)
         ]
         self.positions = self.metadata("positions", positions, torch.long).unsqueeze(0)
-        self.last_indices = self.metadata(
-            "last_indices", [offset - 1 for offset in offsets[1:]], torch.long
+        rows = range(len(counts)) if logit_rows is None else logit_rows
+        last_indices = [offsets[row + 1] - 1 for row in rows]
+        self.last_indices = (
+            self.metadata("last_indices", last_indices, torch.long)
+            if last_indices
+            else None
         )
         self.write_slots = self.metadata(
             "write_slots",

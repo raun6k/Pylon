@@ -14,8 +14,8 @@ class PylonConfig:
     weight_headroom_ratio: float = 0.20
     kv_cache_headroom_ratio: float = 0.20
     prefix_cache_ttl_seconds: float = 300.0
-    prefill_chunk_size: int = 256
-    max_batch_size: int = 8
+    prefill_chunk_size: int = 2048
+    max_batch_size: int = 32
     max_queue_size: int = 32
     batch_wait_ms: float = 2.0
     prefix_cache: bool = True
@@ -98,8 +98,8 @@ def get_config() -> PylonConfig:
         prefix_cache_ttl_seconds=float(
             os.getenv("PYLON_PREFIX_CACHE_TTL_SECONDS", "300")
         ),
-        prefill_chunk_size=int(os.getenv("PYLON_PREFILL_CHUNK_SIZE", "256")),
-        max_batch_size=int(os.getenv("PYLON_MAX_BATCH_SIZE", "8")),
+        prefill_chunk_size=int(os.getenv("PYLON_PREFILL_CHUNK_SIZE", "2048")),
+        max_batch_size=int(os.getenv("PYLON_MAX_BATCH_SIZE", "32")),
         max_queue_size=int(os.getenv("PYLON_MAX_QUEUE_SIZE", "32")),
         batch_wait_ms=float(os.getenv("PYLON_BATCH_WAIT_MS", "2")),
         prefix_cache=_env_bool("PYLON_PREFIX_CACHE", True),

@@ -30,6 +30,52 @@ GENERATION_CONFIG = {
 
 
 class LoaderTests(unittest.TestCase):
+    def test_checkpoint_projections_load_into_the_fused_matrices(self) -> None:
+        from safetensors.torch import save_file
+
+        from pylon.model.config import Qwen3Config
+        from pylon.model.model import Qwen3Model
+        from pylon.model.weights import Qwen3Weights
+
+        config = Qwen3Config(
+            vocab_size=32, context_length=64, hidden_size=16, n_heads=4, n_layers=1,
+            hidden_dim=24, head_dim=4, n_kv_heads=2, dtype=torch.float32,
+        )
+        model = Qwen3Model(config)
+        torch.manual_seed(0)
+        prefix = "model.layers.0"
+        shapes = {
+            "model.embed_tokens.weight": (32, 16),
+            "model.norm.weight": (16,),
+            f"{prefix}.self_attn.q_proj.weight": (16, 16),
+            f"{prefix}.self_attn.k_proj.weight": (8, 16),
+            f"{prefix}.self_attn.v_proj.weight": (8, 16),
+            f"{prefix}.self_attn.o_proj.weight": (16, 16),
+            f"{prefix}.self_attn.q_norm.weight": (4,),
+            f"{prefix}.self_attn.k_norm.weight": (4,),
+            f"{prefix}.input_layernorm.weight": (16,),
+            f"{prefix}.mlp.gate_proj.weight": (24, 16),
+            f"{prefix}.mlp.up_proj.weight": (24, 16),
+            f"{prefix}.mlp.down_proj.weight": (16, 24),
+            f"{prefix}.post_attention_layernorm.weight": (16,),
+        }
+        tensors = {name: torch.randn(shape) for name, shape in shapes.items()}
+        with tempfile.TemporaryDirectory() as directory:
+            save_file(tensors, str(Path(directory) / "model.safetensors"))
+            Qwen3Weights(Path(directory)).load_into(model)
+        attention = model.blocks[0].attention
+        feed_forward = model.blocks[0].feed_forward
+        torch.testing.assert_close(
+            attention.qkv.weight,
+            torch.cat([tensors[f"{prefix}.self_attn.{name}_proj.weight"] for name in "qkv"]),
+        )
+        torch.testing.assert_close(
+            feed_forward.gate_up.weight,
+            torch.cat(
+                [tensors[f"{prefix}.mlp.gate_proj.weight"], tensors[f"{prefix}.mlp.up_proj.weight"]]
+            ),
+        )
+
     def test_rope_base_and_context_come_from_the_file(self) -> None:
         config = read_model_config(FIXTURE, MODEL_ID)
         self.assertEqual(config.rope_theta, 5_000_000)
