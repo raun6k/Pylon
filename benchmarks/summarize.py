@@ -173,11 +173,11 @@ def headline_tables(rows: dict, columns: list[str]) -> str:
 
 
 def plots(rows: dict, columns: list[str]) -> list[Path]:
-    """The two figures from the benchmark spec: decode_heavy, one line per system.
+    """The two figures from the benchmark spec, from decode_heavy.
 
-    Concurrency 1 to 16 spans a 15x range, so the lines overlap on a single axis. Each figure
-    therefore has the absolute values on top and, below, each system as a percentage of vLLM on
-    an axis zoomed to the data.
+    Concurrency 1 to 16 spans a 15x range, so each concurrency gets its own panel and its
+    own axis. Bars start at zero, carry their value, and show each system's value as a
+    percentage of vLLM's.
     """
     import matplotlib
 
@@ -188,52 +188,52 @@ def plots(rows: dict, columns: list[str]) -> list[Path]:
         (
             "ttft_vs_concurrency.png",
             "Time to first token p50 (seconds)",
-            "TTFT, % of vLLM (lower is better)",
             lambda s: s["ttft_seconds"]["p50"],
+            "{:.3f}",
         ),
         (
             "output_tokens_per_second_vs_concurrency.png",
             "Output tokens per second",
-            "Output rate, % of vLLM (higher is better)",
             lambda s: s["output_tokens_per_second"],
+            "{:.1f}",
         ),
     )
+    systems = [name for name in columns if name != "before"]
     PLOTS.mkdir(parents=True, exist_ok=True)
     written = []
-    for filename, ylabel, relative_label, value in specs:
-        series: dict[str, list[tuple[int, float]]] = {}
-        for name in columns:
-            if name == "before":
-                continue
-            series[name] = [
-                (concurrency, value(rows[(name, "decode_heavy", concurrency)]["summary"]))
-                for concurrency in CONCURRENCY
+    for filename, ylabel, value, number in specs:
+        figure, axes = plt.subplots(1, len(CONCURRENCY), figsize=(9.0, 3.8), dpi=140)
+        for axis, concurrency in zip(axes, CONCURRENCY):
+            values = {
+                name: value(rows[(name, "decode_heavy", concurrency)]["summary"])
+                for name in systems
                 if (name, "decode_heavy", concurrency) in rows
-            ]
-        baseline = dict(series.get("vllm", []))
-        figure, (top, bottom) = plt.subplots(
-            2, 1, figsize=(5.2, 5.6), dpi=140, sharex=True, gridspec_kw={"height_ratios": [3, 2]}
-        )
-        for name, points in series.items():
-            if not points:
-                continue
-            color, marker, style = COLUMN_STYLE[name]
-            top.plot(*zip(*points), color=color, marker=marker, linestyle=style, label=COLUMN_LABEL[name])
-            if baseline and name != "vllm":
-                relative = [(c, 100 * v / baseline[c]) for c, v in points if c in baseline]
-                bottom.plot(*zip(*relative), color=color, marker=marker, linestyle=style, label=COLUMN_LABEL[name])
-        if baseline:
-            bottom.axhline(100, color=COLUMN_STYLE["vllm"][0], linestyle="-", label=COLUMN_LABEL["vllm"])
-        top.set_title("decode_heavy")
-        top.set_ylabel(ylabel)
-        top.set_ylim(bottom=0)
-        top.legend(frameon=False)
-        bottom.set_ylabel(relative_label, fontsize=8)
-        bottom.set_xlabel("Concurrency")
-        bottom.set_xticks(CONCURRENCY)
-        for axis in (top, bottom):
-            axis.grid(alpha=0.25)
-        figure.tight_layout()
+            }
+            reference = values.get("vllm")
+            top = max(values.values())
+            for position, name in enumerate(systems):
+                if name not in values:
+                    continue
+                color = COLUMN_STYLE[name][0]
+                axis.bar(position, values[name], color=color, width=0.7, label=COLUMN_LABEL[name])
+                label = number.format(values[name])
+                if reference and name != "vllm":
+                    label += f"\n({100 * values[name] / reference:.0f}%)"
+                axis.text(
+                    position, values[name] + top * 0.015, label, ha="center", va="bottom", fontsize=8
+                )
+            axis.set_title(f"Concurrency {concurrency}", fontsize=10)
+            axis.set_xticks([])
+            axis.set_ylim(0, top * 1.22)
+            axis.grid(axis="y", alpha=0.25)
+            axis.set_axisbelow(True)
+            for edge in ("top", "right"):
+                axis.spines[edge].set_visible(False)
+        axes[0].set_ylabel(ylabel)
+        handles, labels = axes[0].get_legend_handles_labels()
+        figure.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False)
+        figure.suptitle("decode_heavy  (percentages are relative to vLLM)", fontsize=10)
+        figure.tight_layout(rect=(0, 0.07, 1, 0.95))
         path = PLOTS / filename
         figure.savefig(path)
         plt.close(figure)

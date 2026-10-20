@@ -38,7 +38,11 @@ NVIDIA L4, driver 580.126.20, PyTorch 2.14.1+cu130, CUDA 13.0, Qwen/Qwen3-4B-Ins
 - **prefill_heavy:** 2048 prompt tokens, 32 new tokens.
 - **shared_prefix:** 640 prompt tokens, the first 512 identical, 64 new tokens.
 
-<p align="center"><img src="benchmarks/plots/output_tokens_per_second_vs_concurrency.png" alt="decode_heavy output tokens per second" width="46%">&nbsp;&nbsp;&nbsp;&nbsp;<img src="benchmarks/plots/ttft_vs_concurrency.png" alt="decode_heavy time to first token p50" width="46%"><br><sub>decode_heavy output tokens per second · decode_heavy time to first token p50. Each plot repeats the values below as a percentage of vLLM.</sub></p>
+<p align="center"><img src="benchmarks/plots/output_tokens_per_second_vs_concurrency.png" alt="decode_heavy output tokens per second at concurrency 1, 8, and 16" width="90%"></p>
+
+<p align="center"><img src="benchmarks/plots/ttft_vs_concurrency.png" alt="decode_heavy time to first token p50 at concurrency 1, 8, and 16" width="90%"></p>
+
+<p align="center"><sub>decode_heavy output tokens per second, then time to first token p50. Percentages are relative to vLLM.</sub></p>
 
 `eager` is this server with CUDA graphs, the prefix cache, speculation, and skip-ahead admission off. `pylon (before)` is the previous version of this server, with batch cap 8 and prefill chunk 256. A dash means that row was not measured.
 
