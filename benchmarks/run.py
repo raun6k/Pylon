@@ -972,6 +972,9 @@ def main() -> None:
                             "snapshot_revision": revision,
                             "dataset_sha256": dataset_sha256(path),
                             "batch_cap": batch_cap,
+                            "kv_budget_bytes": ((health.get("memory") or {}).get("cache") or {}).get(
+                                "kv_budget_bytes"
+                            ),
                             "prefill_chunk_size": prefill_chunk,
                             "vllm_version": health.get("vllm_version"),
                             "vllm_argv": argv,
