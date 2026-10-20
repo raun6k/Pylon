@@ -1,13 +1,13 @@
 """Turn benchmark result files into the markdown tables and plots the README shows.
 
-    python benchmarks/summarize.py before=<file> eager=<file> pylon=<file> vllm=<file>
+    python benchmarks/summarize.py eager=<file> pylon=<file> vllm=<file>
 
 Each argument names one column and points at a result JSON written by benchmarks/run.py.
 A column can come from several files: repeat the name and the rows are merged.
 
-The columns are one server at three stages plus the reference: the previous release
-(`before`), today's scheduling and memory work with CUDA graphs and the prefix cache off
-(`eager` in the harness), the full server (`pylon`), and vLLM.
+The columns are two configurations of the server plus the reference: the scheduling and
+memory work with CUDA graphs and the prefix cache off (`eager` in the harness), the full
+server (`pylon`), and vLLM.
 """
 
 import json
@@ -19,16 +19,14 @@ TABLES = ROOT / "benchmarks" / "tables"
 PLOTS = ROOT / "benchmarks" / "plots"
 WORKLOADS = ("decode_heavy", "prefill_heavy", "shared_prefix")
 CONCURRENCY = (1, 8, 16)
-COLUMN_ORDER = ("before", "eager", "pylon", "vllm")
+COLUMN_ORDER = ("eager", "pylon", "vllm")
 COLUMN_LABEL = {
     "eager": "pylon, graphs and cache off",
-    "before": "pylon (before)",
     "pylon": "pylon",
     "vllm": "vLLM 0.30.0",
 }
 COLUMN_STYLE = {
-    "eager": ("#66a61e", "s", ":"),
-    "before": ("#bbbbbb", "v", "--"),
+    "eager": ("#9a9a9a", "s", ":"),
     "pylon": ("#1b9e77", "o", "-"),
     "vllm": ("#7570b3", "^", "-"),
 }
@@ -110,28 +108,10 @@ def workload_tables(rows: dict, columns: list[str]) -> str:
     return "\n".join(out)
 
 
-def ratio_table(rows: dict, numerator: str, denominator: str, title: str) -> str:
-    out = [f"### {title}\n", "| Workload | Concurrency | Output tokens/s | TTFT p50 | Inter-token p50 |",
-           "| --- | ---: | ---: | ---: | ---: |"]
-    for workload in WORKLOADS:
-        for concurrency in CONCURRENCY:
-            top = rows.get((numerator, workload, concurrency))
-            bottom = rows.get((denominator, workload, concurrency))
-            if top is None or bottom is None:
-                continue
-            a, b = top["summary"], bottom["summary"]
-            tok = a["output_tokens_per_second"] / b["output_tokens_per_second"]
-            ttft = a["ttft_seconds"]["p50"] / b["ttft_seconds"]["p50"]
-            itl = a["inter_token_seconds"]["p50"] / b["inter_token_seconds"]["p50"]
-            out.append(f"| {workload} | {concurrency} | {tok:.2f}x | {ttft:.2f}x | {itl:.2f}x |")
-    out.append("")
-    return "\n".join(out)
-
-
 def percent_of_vllm_table(rows: dict, columns: list[str]) -> str:
     stages = [name for name in columns if name != "vllm"]
     out = [
-        "### Each stage as a percentage of vLLM 0.30.0\n",
+        "### Each configuration as a percentage of vLLM 0.30.0\n",
         "Output tokens per second (higher is better) / time to first token p50 (lower is better).\n",
         "| Workload | Concurrency | " + " | ".join(COLUMN_LABEL[n] for n in stages) + " |",
         "| --- | ---: | " + " | ".join("---:" for _ in stages) + " |",
@@ -298,14 +278,9 @@ def main() -> None:
             setup_lines(meta, columns),
             "\nTTFT is server time from the request joining the queue to its first token. "
             "32 requests, 3 repeats, temperature 0. pylon and vLLM run with the prefix cache on for "
-            "shared_prefix only; the graphs-and-cache-off stage never has it.\n",
+            "shared_prefix only; the graphs-and-cache-off configuration never has it.\n",
             workload_tables(rows, columns),
         ]
-        + (
-            [ratio_table(rows, "pylon", "before", "pylon vs pylon (before)")]
-            if "before" in columns
-            else []
-        )
         + ([percent_of_vllm_table(rows, columns)] if "vllm" in columns else [])
     )
     path = TABLES / "summary.md"
