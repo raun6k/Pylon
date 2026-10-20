@@ -63,6 +63,16 @@ class Decoder:
         self._paged_decode_batch: PagedBatchCache | None = None
         self._packed_batch: PackedBatchCache | None = None
 
+    def release_page_pool(self) -> None:
+        """Drop the page pool and the cached batches that still point at it.
+
+        Those batches keep their pool alive, so without this a replaced pool stays
+        resident next to its replacement.
+        """
+        self.page_pool = None
+        self._paged_decode_batch = None
+        self._packed_batch = None
+
     def generate(
         self,
         input_ids: list[int],

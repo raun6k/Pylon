@@ -236,7 +236,7 @@ class Engine:
             self.prefix_cache.clear()
             if getattr(self.decoder, "graphs", None) is not None:
                 self.decoder.graphs = None
-            self.decoder.page_pool = None
+            self.decoder.release_page_pool()
 
     def enqueue(
         self,
@@ -865,7 +865,7 @@ class Engine:
             if self._active_requests:
                 raise RuntimeError("Cannot reprofile KV memory while requests are active.")
             self.prefix_cache.clear()
-            self.decoder.page_pool = None
+            self.decoder.release_page_pool()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             cache = self._memory_checker.cache(

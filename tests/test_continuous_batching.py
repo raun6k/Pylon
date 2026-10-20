@@ -14,7 +14,7 @@ from pylon.model.model import Qwen3Model
 from pylon.config import PylonConfig, get_config
 from pylon.engine import FULL_BATCH_PREFILL_WAIT_SECONDS, Engine, skip_prefill_wave
 from pylon.kv.budget import CacheCapacity, MemoryReport
-from pylon.kv.cache import PackedBatchCache, PagedBatchCache
+from pylon.kv.cache import PackedBatchCache, PagedBatchCache, PagedKVCache
 from pylon.kv.pool import KVPagePool
 from pylon.model.config import Qwen3Config
 from pylon.prefix.cache import hash_token_blocks
@@ -109,6 +109,9 @@ class FakeDecoder:
 
     def release_cache(self, cache) -> None:
         cache.close()
+
+    def release_page_pool(self) -> None:
+        self.page_pool = None
 
     def _synchronize(self) -> None:
         return None
@@ -375,6 +378,50 @@ class ContinuousBatchingTests(unittest.TestCase):
         self.assertEqual(prefill_tokens, 4 * 640 + 4 * 128)
         pool = engine.decoder.page_pool
         self.assertEqual(pool.free_pages, pool.num_pages - 2)
+
+    def test_replacing_the_page_pool_frees_the_old_one_before_sizing_the_new_one(self) -> None:
+        import gc
+        import weakref
+
+        torch.manual_seed(0)
+        config = Qwen3Config(
+            vocab_size=64, context_length=2048, hidden_size=16, n_heads=2, n_layers=1,
+            hidden_dim=32, head_dim=8, n_kv_heads=1, dtype=torch.float32,
+        )
+        bytes_per_token = config.n_layers * 2 * config.n_kv_heads * config.head_dim * 4
+        budget_bytes = 2048 * bytes_per_token
+        capacity = CacheCapacity(budget_bytes, 0, 0, bytes_per_token, 2048, budget_bytes, 0)
+        report = MemoryReport("test-cpu", budget_bytes, 1.0, budget_bytes, budget_bytes, 0, 0, True, capacity)
+        old_pool: list[weakref.ref] = []
+        alive_when_sized: list[bool] = []
+
+        class Checker:
+            def cache(self, model_config, *, warmup_peak_bytes, warmup_kv_bytes):
+                gc.collect()
+                alive_when_sized.append(old_pool[0]() is not None)
+                return capacity
+
+        with patch("pylon.scheduler.queue.Thread"):
+            engine = Engine(
+                PylonConfig(model_id="test-cpu", max_batch_size=2, prefill_chunk_size=256, batch_wait_ms=0),
+                decoder=Decoder(Qwen3Model(config).eval()),
+                capacity=capacity,
+                report=report,
+            )
+        self.addCleanup(engine.close)
+        engine._memory_checker = Checker()
+        decoder = engine.decoder
+        caches = [PagedKVCache(decoder.page_pool, 300) for _ in range(2)]
+        decoder.packed_caches(caches, [[1] * 40, [2] * 5])
+        decoder.decode_caches(caches, [3, 4])
+        for held in caches:
+            decoder.release_cache(held)
+        caches.clear()
+        del held
+        old_pool.append(weakref.ref(decoder.page_pool))
+        engine.update_cache_capacity(warmup_peak_bytes=0, warmup_kv_bytes=0)
+        self.assertEqual(alive_when_sized, [False])
+        self.assertIsNot(decoder.page_pool, old_pool[0]())
 
     def test_prefix_cache_flag_stores_nothing(self) -> None:
         engine = self.make_engine(
